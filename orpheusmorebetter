@@ -13,6 +13,7 @@ import tempfile
 import traceback
 import logging
 import html
+import unicodedata
 from urllib.parse import urlparse, parse_qsl
 from multiprocessing import cpu_count
 from typing import List
@@ -26,6 +27,43 @@ import models.format as formats
 
 if sys.version_info < (3, 10, 0): # investigate 311
     raise Exception("Requires Python 3.10.0 or newer")
+
+
+def _match_key(name: str) -> str:
+    """Normalize a filename for tolerant matching.
+
+    Orpheus stores folder names that can contain invisible formatting
+    characters (e.g. U+200E LEFT-TO-RIGHT MARK) and a particular Unicode
+    normalization form. The same folder written to disk by a different OS or
+    over a network share (e.g. a Linux Samba share mounted on macOS) may drop
+    those characters or use a different normalization form. Stripping
+    non-printable characters and normalizing to NFC lets both forms match.
+    """
+    stripped = "".join(ch for ch in name if ch.isprintable())
+    return unicodedata.normalize("NFC", stripped)
+
+
+def resolve_existing_dir(base: str, rel: str) -> str | None:
+    """Return the real on-disk path for ``base/rel`` if it can be found.
+
+    Tries the exact path first, then falls back to matching entries in the
+    parent directory by a normalized key, so releases whose folder names differ
+    only by hidden characters or Unicode normalization are still located.
+    """
+    exact = os.path.join(base, rel)
+    if os.path.exists(exact):
+        return exact
+
+    parent = os.path.dirname(exact)
+    target = _match_key(os.path.basename(rel))
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return None
+    for entry in entries:
+        if _match_key(entry) == target:
+            return os.path.join(parent, entry)
+    return None
 
 
 def banner():
@@ -394,10 +432,16 @@ def main():
                 logger.warning(f"Path not found - skipping: {flac_file}")
                 continue
         else:
+            unescaped = html.unescape(torrent.filePath)
             for d in data_dir:
-                flac_dir = os.path.join(d, html.unescape(torrent.filePath))
-                if os.path.exists(flac_dir):
+                resolved = resolve_existing_dir(d, unescaped)
+                if resolved is not None:
+                    flac_dir = resolved
                     break
+            if flac_dir is None:
+                # Nothing matched on disk; keep a nominal path so the
+                # downstream "Path not found" message stays meaningful.
+                flac_dir = os.path.join(data_dir[0], unescaped)
 
         if flac_dir is None:
             logger.warning(f'Flac dir unset for release {torrentid}')
