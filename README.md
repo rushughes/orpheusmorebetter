@@ -166,3 +166,37 @@ orpheusmorebetter https://orpheus.network/torrents.php?id=1000\&torrentid=100000
 Note that if you specify a particular release(s), orpheusmorebetter will ignore your configuration's media types and attempt to transcode the releases you have specified regardless of their media type. (so long as they are lossless types)
 
 Your first time running orpheusmorebetter might take a while, but after it has successfully checked all eligible files it will go faster upon each consecutive run, as outputs are cached.
+
+Listing missing transcodes (`orpheusmissing`)
+----------------------------------------------
+
+`orpheusmissing` is a read-only companion command. It scans your Orpheus history and reports which FLAC releases are **missing** an MP3 V0 and/or 320 transcode — without transcoding or uploading anything. Use it to see your backlog before committing to a (potentially long) transcode run.
+
+It shares the same configuration file as `orpheusmorebetter` (`~/.orpheusmorebetter/config`), so no extra setup is needed. It only reads from the API — it does not touch your local FLACs, `data_dir`, or any external tools (`lame`, `sox`, etc.).
+
+```bash
+usage: orpheusmissing [-h] [--config CONFIG] [--cache CACHE] [--no-cache]
+                      [-m MODE] [--formats FORMATS] [--media MEDIA]
+                      [-o OUTPUT] [--format-out {text,urls,csv}] [-t TOTP]
+                      [--version] [-d]
+```
+
+Key options:
+
+ - `-m, --mode` — which history to scan: `snatched` (default; things you've downloaded), `uploaded`, `both`, `seeding`, or `all`.
+ - `--format-out` — `text` (default, human-readable), `csv`, or `urls` (one release URL per line).
+ - `-o, --output` — write the report to a file instead of stdout (progress still goes to stderr).
+ - `--formats` / `--media` — override the config values for this run.
+ - `--cache` — location of the report cache. This is a **separate** cache from the transcode tool's (default `~/.orpheusmorebetter/report_cache`), so listing releases never marks them as "processed" for `orpheusmorebetter`. Use `--no-cache` to re-check everything.
+
+The `urls` output format is designed to feed straight back into `orpheusmorebetter`, which accepts a file of release URLs:
+
+```bash
+# 1. Discover everything you've snatched that's missing a V0/320
+orpheusmissing -m snatched --format-out urls -o backlog.txt
+
+# 2. Transcode and upload the whole backlog
+orpheusmorebetter backlog.txt
+```
+
+Note: `orpheusmissing` is purely API-based, so it cannot detect 24-bit or multichannel releases (those checks need the local FLAC). A small number of releases in the URL list may therefore be skipped by `orpheusmorebetter` when it inspects the actual files — this is expected.

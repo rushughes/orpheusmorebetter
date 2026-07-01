@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""orpheusmissing -- list FLAC releases in your history missing V0/320 MP3s.
+
+A read-only, discovery-only companion to ``orpheusmorebetter``. It scans your
+Orpheus history (snatched by default) and reports which FLAC releases are
+missing an MP3 V0 and/or 320 transcode. It never transcodes or uploads.
+
+Output can be a human report (default), CSV, or a plain URL list that can be fed
+straight back into the transcoder:
+
+    orpheusmissing --format-out urls -o backlog.txt
+    orpheusmorebetter backlog.txt
+"""
+
+import argparse
+import configparser
+import logging
+import os
+import pickle
+import sys
+from datetime import datetime
+
+from _version import __version__
+
+from services import whatapi
+from services import report
+import models.format as formats
+
+if sys.version_info < (3, 10, 0):
+    raise Exception("Requires Python 3.10.0 or newer")
+
+
+def parse_requested_formats(formats_str: str) -> set:
+    requested = set()
+    for format_str in formats_str.split(","):
+        cleaned = format_str.strip().upper()
+        if "FLAC" in cleaned:
+            requested.add(formats.Flac)
+        elif "320" in cleaned:
+            requested.add(formats.MP3_320)
+        elif "V0" in cleaned:
+            requested.add(formats.MP3_V0)
+    return requested
+
+
+def main():
+    if not os.path.exists("logs/"):
+        os.mkdir("logs")
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter, prog="orpheusmissing"
+    )
+    parser.add_argument(
+        "--config",
+        help="the location of the configuration file",
+        default=os.path.expanduser("~/.orpheusmorebetter/config"),
+    )
+    parser.add_argument(
+        "--cache",
+        help="the location of the report cache (kept separate from the "
+        "transcode tool's cache so it never marks releases as processed)",
+        default=os.path.expanduser("~/.orpheusmorebetter/report_cache"),
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="ignore the cache: re-check every release and don't record results",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        default="snatched",
+        help="which history to scan; snatched, uploaded, both, seeding, or all",
+    )
+    parser.add_argument(
+        "--formats",
+        help="comma-separated formats to check for; defaults to the config's "
+        "'formats' value",
+        default=None,
+    )
+    parser.add_argument(
+        "--media",
+        help="comma-separated media types to include; defaults to the config's "
+        "'media' value",
+        default=None,
+    )
+    parser.add_argument(
+        "-o", "--output", help="write the report to a file instead of stdout",
+        default=None,
+    )
+    parser.add_argument(
+        "--format-out",
+        choices=["text", "urls", "csv"],
+        default="text",
+        help="output format",
+    )
+    parser.add_argument(
+        "-t", "--totp", help="time based one time password for 2FA", default=None
+    )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s " + __version__
+    )
+    parser.add_argument("-d", "--debug", action="store_true")
+
+    args = parser.parse_args()
+
+    level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(f"logs/{str(datetime.now())}.txt", mode="w"),
+            # progress goes to stderr so stdout stays clean for the report
+            logging.StreamHandler(sys.stderr),
+        ],
+    )
+    logger = logging.getLogger("main")
+
+    # ---- config ---------------------------------------------------------
+    config = configparser.ConfigParser(interpolation=None)
+    if not os.path.exists(args.config):
+        logger.error(
+            "No configuration file found at %s. Run orpheusmorebetter once to "
+            "generate and edit it.", args.config
+        )
+        sys.exit(2)
+    config.read(args.config)
+
+    username = config.get("orpheus", "username")
+    password = config.get("orpheus", "password")
+
+    endpoint = config.get("orpheus", "api", fallback="https://orpheus.network/")
+    if not endpoint.endswith("/"):
+        endpoint += "/"
+
+    formats_str = args.formats or config.get("orpheus", "formats", fallback="v0, 320")
+    requested_formats = parse_requested_formats(formats_str)
+    if not requested_formats:
+        logger.error("No valid formats to check for in %r", formats_str)
+        sys.exit(2)
+
+    media_str = args.media if args.media is not None else config.get(
+        "orpheus", "media", fallback=""
+    )
+    if not media_str.strip():
+        supported_media = whatapi.lossless_media
+    else:
+        supported_media = set(m.strip().lower() for m in media_str.split(","))
+        if not supported_media.issubset(whatapi.lossless_media):
+            bad = (supported_media - whatapi.lossless_media).pop()
+            logger.error("Unsupported media type %r. Supported: %s", bad,
+                         ", ".join(whatapi.lossless_media))
+            sys.exit(2)
+
+    # ---- login ----------------------------------------------------------
+    logger.info("Logging in to Orpheus Network...")
+    api = whatapi.WhatAPI(username, password, endpoint, args.totp)
+
+    # ---- cache ----------------------------------------------------------
+    seen: set[str] = set()
+    if not args.no_cache:
+        try:
+            with open(args.cache, "rb") as f:
+                seen = pickle.load(f)
+        except OSError:
+            logger.info("Report cache not found, starting fresh.")
+
+    skip = None if args.no_cache else seen
+
+    # ---- scan -----------------------------------------------------------
+    logger.info(
+        "Scanning %s history for releases missing: %s",
+        args.mode,
+        ", ".join(sorted(f.long_name or f.name for f in requested_formats)),
+    )
+
+    record = None if args.no_cache else (lambda tid: seen.add(str(tid)))
+
+    items = []
+    try:
+        for item in report.find_missing(
+            api, args.mode, supported_media, requested_formats,
+            skip=skip, on_examined=record,
+        ):
+            items.append(item)
+    finally:
+        if not args.no_cache:
+            with open(args.cache, "wb") as f:
+                pickle.dump(seen, f)
+
+    # ---- render ---------------------------------------------------------
+    rendered = report.RENDERERS[args.format_out](items)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(rendered)
+        logger.info("Wrote %d item(s) to %s", len(items), args.output)
+    else:
+        # report to stdout, distinct from the stderr progress log
+        sys.stdout.write(rendered)
+
+    logger.info("Done. %d release(s) missing requested formats.", len(items))
+
+
+if __name__ == "__main__":
+    main()
