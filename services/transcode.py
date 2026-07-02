@@ -388,13 +388,21 @@ def transcode_release(
     output_format: Format,
     source_torrent: Torrent,
     source_torrent_group: TorrentGroup,
+    edition: str | None = None,
 ):
     """
     Transcode a FLAC release into another format.
     """
     flac_dir = os.path.abspath(flac_dir)
     output_dir = os.path.abspath(output_dir)
-    flac_files = locate(flac_dir, ext_matcher(".flac"))
+    flac_files = list(locate(flac_dir, ext_matcher(".flac")))
+
+    # Fail loudly on a source with no FLACs rather than silently producing an
+    # empty "successful" transcode (e.g. a folder that actually holds .m4a).
+    if not flac_files:
+        raise TranscodeException(
+            f'No FLAC files found in source directory "{flac_dir}"'
+        )
 
     # check if we need to resample
     resample = needs_resampling(flac_dir)
@@ -415,13 +423,22 @@ def transcode_release(
     # transcode_dir is a new directory created exclusively for this
     # transcode. Do not change this assumption without considering the
     # consequences!
-    transcode_dir = os.path.join(output_dir, source_torrent_group.get_transcode_dirname(source_torrent, output_format))
+    transcode_dir = os.path.join(output_dir, source_torrent_group.get_transcode_dirname(source_torrent, output_format, edition))
     logging.info("    " + transcode_dir)
     if not os.path.exists(transcode_dir):
         os.makedirs(transcode_dir)
     else:
-        return transcode_dir
-        # raise TranscodeException('transcode output directory "%s" already exists' % transcode_dir)
+        # Do NOT silently reuse a pre-existing directory. Different editions in
+        # the same group can resolve to the same folder name (e.g. two versions
+        # of a soundtrack, both bare "{CD}"); reusing it would package the wrong
+        # edition's audio into this upload. Fail loudly instead -- pass a unique
+        # --edition label to disambiguate.
+        raise TranscodeException(
+            f'Transcode output directory already exists: "{transcode_dir}". '
+            f'This usually means another edition in the same group produced the '
+            f'same folder name -- rerun with a unique --edition label, or remove '
+            f'the stale directory.'
+        )
 
     try:
         arg_list = [

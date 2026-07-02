@@ -184,6 +184,14 @@ def main():
     parser.add_argument(
         "-o", "--source", help="the value to put in the source flag in created torrents"
     )
+    parser.add_argument(
+        "--edition",
+        help="edition label to put in the transcode folder name (e.g. "
+        "\"Expanded 2CD\"); overrides the release's edition/remaster title. Use "
+        "to disambiguate different editions in the same group that would "
+        "otherwise share a folder name.",
+        default=None,
+    )
     parser.add_argument("-d", "--debug", action="store_true")
 
     args = parser.parse_args()
@@ -530,7 +538,7 @@ def main():
                     os.mkdir(local_torrent_dir)
 
                 try:
-                    transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, format, torrent, group)
+                    transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, format, torrent, group, args.edition)
                     new_torrent = transcode.make_torrent(
                         transcode_dir, tmpdir, tracker, api.passkey, source
                     )

@@ -167,6 +167,18 @@ Note that if you specify a particular release(s), orpheusmorebetter will ignore 
 
 Your first time running orpheusmorebetter might take a while, but after it has successfully checked all eligible files it will go faster upon each consecutive run, as outputs are cached.
 
+Disambiguating editions (`--edition`)
+-------------------------------------
+
+Two different torrents in the same group (e.g. a standard soundtrack and an "Expanded" edition) can produce the **same** transcode folder name when neither carries a distinct edition/remaster title — both end up as `… {CD} [MP3 320]`. To keep them apart, pass `--edition` with a meaningful label:
+
+```bash
+orpheusmorebetter --edition "Expanded 2CD" "https://orpheus.network/torrents.php?id=92430\&torrentid=1966628"
+# -> …Quantum of Solace {CD ~ Expanded 2CD} [MP3 320]
+```
+
+The label is injected into the edition segment and overrides the release's own remaster title in the folder name. If two editions would still collide (e.g. you forget the label), orpheusmorebetter now **stops with an error** rather than silently packaging the other edition's audio into your upload.
+
 Listing missing transcodes (`orpheusmissing`)
 ----------------------------------------------
 

@@ -52,7 +52,8 @@ class TorrentGroup(BaseModel):
     def get_transcode_dirname(
             self,
             source_torrent: Torrent,
-            target_format: Format
+            target_format: Format,
+            edition: str | None = None,
         ) -> str:
         """Helper function for grabbing the eventual dirname for the transcode.
 
@@ -60,6 +61,10 @@ class TorrentGroup(BaseModel):
             source_torrent (Torrent): Transcode source torrent.
             artist_name (str): Self explanatory.
             target_format (Literal[&#39;FLAC&#39;, &#39;MP3 320&#39;, &#39;MP3 V0&#39;]): Self explanatory.
+            edition (str | None): Optional edition label. When supplied it
+                overrides the media/edition segment of the folder name (e.g.
+                ``{CD ~ Expanded 2CD}``), so distinct editions in the same group
+                that would otherwise share a name can be disambiguated.
 
         Raises:
             ValueError: Raised if torrent group ID doesn't match this group's ID.
@@ -71,6 +76,10 @@ class TorrentGroup(BaseModel):
 
         if source_torrent.groupId != self.id:
             raise ValueError(f"Provided source torrent group ID does not match group's ID: {source_torrent.groupId} != {self.id}")
-        transcode_folder = f"{self.formatted_artist_string} - {self.year} - {self.name[:min(100, len(self.name))]} {source_torrent.formatted_media_info} [{target_format.long_name}]"
+        if edition:
+            media_info = f"{{{source_torrent.media} ~ {edition}}}"
+        else:
+            media_info = source_torrent.formatted_media_info
+        transcode_folder = f"{self.formatted_artist_string} - {self.year} - {self.name[:min(100, len(self.name))]} {media_info} [{target_format.long_name}]"
         transcode_folder = re.sub(r'[\?<>\\*\|":\/]', "_", transcode_folder) # Removes the following from folder names and replaces with underscore: ?<>\*|":/ 
         return transcode_folder
