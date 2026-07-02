@@ -93,6 +93,92 @@ def ext_matcher(*extensions: str) -> Callable[[str], bool]:
     return lambda f: os.path.splitext(f)[-1].lower() in extensions
 
 
+# Non-FLAC containers that may hold lossless audio we can losslessly remux.
+REMUXABLE_EXTENSIONS = (".m4a", ".mp4", ".m4b")
+# Codecs inside those containers that are lossless and therefore safe to remux
+# to FLAC without any generational quality loss. (AAC etc. are deliberately
+# excluded -- transcoding a lossy source to FLAC/MP3 is not acceptable.)
+LOSSLESS_REMUX_CODECS = {"flac", "alac"}
+
+# Non-audio files worth carrying into a transcode (cover art, logs, etc.).
+SIDECAR_EXTENSIONS = (
+    ".cue", ".gif", ".jpeg", ".jpg", ".log",
+    ".md5", ".nfo", ".pdf", ".png", ".sfv", ".txt",
+)
+
+
+def audio_codec(path: str) -> Optional[str]:
+    """Return the first audio stream's codec name via ffprobe, or None if it
+    can't be determined (ffprobe missing, or the file has no audio)."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return out.decode(errors="replace").strip() or None
+
+
+def find_remuxable(source_dir: str) -> list[str]:
+    """Find non-FLAC files under source_dir that hold lossless audio we can
+    losslessly remux to FLAC (e.g. FLAC or ALAC inside an .m4a container)."""
+    remuxable: list[str] = []
+    for f in locate(source_dir, ext_matcher(*REMUXABLE_EXTENSIONS)):
+        if audio_codec(f) in LOSSLESS_REMUX_CODECS:
+            remuxable.append(f)
+    return sorted(remuxable)
+
+
+def remux_to_flac(files: list[str], source_dir: str, dest_dir: str) -> list[str]:
+    """Losslessly remux the given container files to FLAC under dest_dir,
+    preserving their relative layout and copying over sidecar files (art, logs)
+    so the eventual transcode is complete. Returns the FLAC paths created.
+
+    Requires ffmpeg. The audio is re-encoded to the FLAC codec but the samples
+    are identical to the (already lossless) source, so there is no quality loss.
+    """
+    outputs: list[str] = []
+    for f in files:
+        rel = os.path.relpath(f, source_dir)
+        out_path = os.path.join(dest_dir, os.path.splitext(rel)[0] + ".flac")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        command = [
+            "ffmpeg", "-nostdin", "-v", "error", "-y",
+            "-i", f,
+            "-map", "0:a",
+            "-c:a", "flac", "-compression_level", "8",
+            "-map_metadata", "0",
+            out_path,
+        ]
+        try:
+            subprocess.check_output(command, stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            raise TranscodeException(
+                "ffmpeg is required to remux non-FLAC sources but was not found"
+            )
+        except subprocess.CalledProcessError as e:
+            raise TranscodeException(
+                'Remux of "{0}" failed: {1}'.format(f, e.output)
+            )
+        outputs.append(out_path)
+
+    # Carry sidecar files (cover art, logs, cue sheets, ...) alongside.
+    for side in locate(source_dir, ext_matcher(*SIDECAR_EXTENSIONS)):
+        rel = os.path.relpath(side, source_dir)
+        dst = os.path.join(dest_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(side, dst)
+
+    return outputs
+
+
 def is_24bit(flac_dir: str) -> bool:
     """
     Returns True if any FLAC within flac_dir is 24 bit.

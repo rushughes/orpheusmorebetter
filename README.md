@@ -22,13 +22,13 @@ If you are on a seedbox or a system without access to superuser, try the followi
 pip install --user -r requirements.txt
 ```
 
-In addition to these Python packages, you will need to install several external dependencies: `mktorrent` 1.1+, `flac`, `lame`, and `sox`. The method of installing these programs varies depending on your operating system.
+In addition to these Python packages, you will need to install several external dependencies: `mktorrent` 1.1+, `flac`, `lame`, and `sox`. `ffmpeg` is also recommended -- it is used to auto-remux non-FLAC lossless sources (see below), but is only required if you use that feature. The method of installing these programs varies depending on your operating system.
 
 ```bash
 # For Ubuntu-based systems
-apt install mktorrent flac lame sox
+apt install mktorrent flac lame sox ffmpeg
 # For Arch-based systems
-sudo pacman -S mktorrent flac lame sox
+sudo pacman -S mktorrent flac lame sox ffmpeg
 ```
 
 If you are on a seedbox and you lack the privilages to install packages, you could contact your provider to have these packages installed.
@@ -166,6 +166,15 @@ orpheusmorebetter https://orpheus.network/torrents.php?id=1000\&torrentid=100000
 Note that if you specify a particular release(s), orpheusmorebetter will ignore your configuration's media types and attempt to transcode the releases you have specified regardless of their media type. (so long as they are lossless types)
 
 Your first time running orpheusmorebetter might take a while, but after it has successfully checked all eligible files it will go faster upon each consecutive run, as outputs are cached.
+
+Non-FLAC lossless sources (auto-remux)
+--------------------------------------
+
+Some lossless releases ship their audio in a non-FLAC container -- for example FLAC or ALAC inside `.m4a`. Since orpheusmorebetter transcodes from `.flac`, it would otherwise skip these with "No FLAC files found".
+
+When the source directory has no `.flac` files, orpheusmorebetter now probes the other files with `ffmpeg`/`ffprobe` and, if it finds **lossless** audio (FLAC or ALAC) in a container like `.m4a`, it losslessly remuxes them to FLAC in a temporary directory, transcodes from there, and deletes the temporary FLACs afterward. Cover art and other sidecar files are carried along. Lossy sources (e.g. AAC) are never remuxed.
+
+This requires `ffmpeg`. Pass `--no-remux` to disable the behavior and keep the original "no FLAC files" skip.
 
 Disambiguating editions (`--edition`)
 -------------------------------------

@@ -192,6 +192,12 @@ def main():
         "otherwise share a folder name.",
         default=None,
     )
+    parser.add_argument(
+        "--no-remux",
+        action="store_true",
+        help="don't auto-remux non-FLAC lossless sources (e.g. FLAC/ALAC "
+        "inside .m4a) to FLAC before transcoding",
+    )
     parser.add_argument("-d", "--debug", action="store_true")
 
     args = parser.parse_args()
@@ -459,106 +465,134 @@ def main():
         if (flac_dir != cleaned_flac_dir):
             logger.warning(f'This OPH folder name has hidden characters. You may be able to re-upload this manually and trump the original.')
 
-        if int(do_24_bit):
-            try:
-                if (
-                    transcode.is_24bit(flac_dir)
-                    and torrent.encoding != "24bit Lossless"
-                ):
-                    # A lot of people are uploading FLACs from Bandcamp without realizing
-                    # that they're actually 24 bit files (usually 24/44.1). Since we know for
-                    # sure whether the files are 24 bit, we might as well correct the listing
-                    # on the site (and get an extra upload in the process).
-                    if args.no_24bit_edit:
-                        logger.warning("Release is actually 24-bit lossless, skipping.")
-                        continue
-                    if int(do_24_bit) == 1:
-                        confirmation = input("Mark release as 24bit lossless? y/n: ")
-                        if confirmation != "y":
-                            continue
-                    logger.info("  Marking release as 24bit lossless.")
-                    api.set_24bit(torrent)
-                    group = api.request_ajax("torrentgroup", id=groupid)
-                    torrent = [t for t in group["torrents"] if t["id"] == torrentid][0]
-            except Exception as e:
-                logger.error(
-                    "Error: can't edit 24-bit torrent - skipping: {0}".format(e)
-                )
-                continue
-
-        if transcode.is_multichannel(flac_dir):
-            logger.warning(
-                "This is a multichannel release, which is unsupported - skipping"
-            )
-            continue
-
-        needed = formats_needed(group, torrent, requested_formats)
-        logger.info("  Formats needed: {0}".format(", ".join(f'{e.name} {e.encoding}' for e in needed)))
-
-        if needed:
-            # Before proceeding, do the basic tag checks on the source
-            # files to ensure any uploads won't be reported, but punt
-            # on the tracknumber formatting; problems with tracknumber
-            # may be fixable when the tags are copied.
-            broken_tags = False
-            for flac_file in transcode.locate(flac_dir, transcode.ext_matcher(".flac")):
-                (ok, msg) = tagging.check_tags(
-                    flac_file, check_tracknumber_format=False
-                )
-                if not ok:
-                    logger.error(
-                        "A FLAC file in this release has unacceptable tags - skipping: {0}".format(
-                            msg
-                        )
+        # If the source has no FLAC files but contains lossless audio in another
+        # container (e.g. FLAC/ALAC inside .m4a), remux to real FLACs in a temp
+        # staging directory and transcode from there. The staging directory is
+        # removed once the release has been processed (see finally below).
+        staging_dir = None
+        if not args.no_remux and not any(
+            transcode.locate(flac_dir, transcode.ext_matcher(".flac"))
+        ):
+            remuxable = transcode.find_remuxable(flac_dir)
+            if remuxable:
+                logger.info(
+                    "  No FLAC files found; remuxing {0} lossless file(s) to FLAC...".format(
+                        len(remuxable)
                     )
-                    logger.error("You might be able to trump it.")
-                    broken_tags = True
-                    break
-            if broken_tags:
-                continue
-
-        for format in needed:
-            if os.path.exists(flac_dir):
-                logger.info("    Creating format {0}...".format(format.long_name))
-                tmpdir = tempfile.mkdtemp()
-
-                local_output_dir: str = config.get(
-                    "orpheus", "output_dir_{}".format(format), fallback=output_dir
                 )
-                if not local_output_dir.endswith("/"):
-                    local_output_dir += "/"
-
-                local_torrent_dir: str = config.get(
-                    "orpheus", "torrent_dir_{}".format(format), fallback=torrent_dir
-                )
-                if not local_torrent_dir.endswith("/"):
-                    local_torrent_dir += "/"
-
-                if not os.path.exists(local_torrent_dir):
-                    os.mkdir(local_torrent_dir)
-
+                staging_dir = tempfile.mkdtemp(prefix="omb_remux_")
                 try:
-                    transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, format, torrent, group, args.edition)
-                    new_torrent = transcode.make_torrent(
-                        transcode_dir, tmpdir, tracker, api.passkey, source
-                    )
-                    logger.info("      Transcode successful, torrent created")
-                    if upload_torrent:
-                        logger.info("      Uploading to OPS...")
-                        description = create_description(torrent, flac_dir, format)
-                        api.upload(group, torrent, new_torrent, format, description)
-                    shutil.copy(new_torrent, local_torrent_dir)
-                    logger.info("      Success.")
-                    if args.single:
-                        break
+                    transcode.remux_to_flac(remuxable, flac_dir, staging_dir)
                 except Exception as e:
-                    logger.error("      Error adding format {0}: {1}".format(format, e))
-                    traceback.print_exc()
-                finally:
-                    shutil.rmtree(tmpdir)
-            else:
-                logger.error("    Path not found - skipping: {0}".format(flac_dir))
-                break
+                    logger.error("  Remux failed - skipping: {0}".format(e))
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    continue
+                flac_dir = staging_dir
+
+        try:
+            if int(do_24_bit):
+                try:
+                    if (
+                        transcode.is_24bit(flac_dir)
+                        and torrent.encoding != "24bit Lossless"
+                    ):
+                        # A lot of people are uploading FLACs from Bandcamp without realizing
+                        # that they're actually 24 bit files (usually 24/44.1). Since we know for
+                        # sure whether the files are 24 bit, we might as well correct the listing
+                        # on the site (and get an extra upload in the process).
+                        if args.no_24bit_edit:
+                            logger.warning("Release is actually 24-bit lossless, skipping.")
+                            continue
+                        if int(do_24_bit) == 1:
+                            confirmation = input("Mark release as 24bit lossless? y/n: ")
+                            if confirmation != "y":
+                                continue
+                        logger.info("  Marking release as 24bit lossless.")
+                        api.set_24bit(torrent)
+                        group = api.request_ajax("torrentgroup", id=groupid)
+                        torrent = [t for t in group["torrents"] if t["id"] == torrentid][0]
+                except Exception as e:
+                    logger.error(
+                        "Error: can't edit 24-bit torrent - skipping: {0}".format(e)
+                    )
+                    continue
+
+            if transcode.is_multichannel(flac_dir):
+                logger.warning(
+                    "This is a multichannel release, which is unsupported - skipping"
+                )
+                continue
+
+            needed = formats_needed(group, torrent, requested_formats)
+            logger.info("  Formats needed: {0}".format(", ".join(f'{e.name} {e.encoding}' for e in needed)))
+
+            if needed:
+                # Before proceeding, do the basic tag checks on the source
+                # files to ensure any uploads won't be reported, but punt
+                # on the tracknumber formatting; problems with tracknumber
+                # may be fixable when the tags are copied.
+                broken_tags = False
+                for flac_file in transcode.locate(flac_dir, transcode.ext_matcher(".flac")):
+                    (ok, msg) = tagging.check_tags(
+                        flac_file, check_tracknumber_format=False
+                    )
+                    if not ok:
+                        logger.error(
+                            "A FLAC file in this release has unacceptable tags - skipping: {0}".format(
+                                msg
+                            )
+                        )
+                        logger.error("You might be able to trump it.")
+                        broken_tags = True
+                        break
+                if broken_tags:
+                    continue
+
+            for format in needed:
+                if os.path.exists(flac_dir):
+                    logger.info("    Creating format {0}...".format(format.long_name))
+                    tmpdir = tempfile.mkdtemp()
+
+                    local_output_dir: str = config.get(
+                        "orpheus", "output_dir_{}".format(format), fallback=output_dir
+                    )
+                    if not local_output_dir.endswith("/"):
+                        local_output_dir += "/"
+
+                    local_torrent_dir: str = config.get(
+                        "orpheus", "torrent_dir_{}".format(format), fallback=torrent_dir
+                    )
+                    if not local_torrent_dir.endswith("/"):
+                        local_torrent_dir += "/"
+
+                    if not os.path.exists(local_torrent_dir):
+                        os.mkdir(local_torrent_dir)
+
+                    try:
+                        transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, format, torrent, group, args.edition)
+                        new_torrent = transcode.make_torrent(
+                            transcode_dir, tmpdir, tracker, api.passkey, source
+                        )
+                        logger.info("      Transcode successful, torrent created")
+                        if upload_torrent:
+                            logger.info("      Uploading to OPS...")
+                            description = create_description(torrent, flac_dir, format)
+                            api.upload(group, torrent, new_torrent, format, description)
+                        shutil.copy(new_torrent, local_torrent_dir)
+                        logger.info("      Success.")
+                        if args.single:
+                            break
+                    except Exception as e:
+                        logger.error("      Error adding format {0}: {1}".format(format, e))
+                        traceback.print_exc()
+                    finally:
+                        shutil.rmtree(tmpdir)
+                else:
+                    logger.error("    Path not found - skipping: {0}".format(flac_dir))
+                    break
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
         seen.add(str(torrentid))
         pickle.dump(seen, open(args.cache, "wb"))
     logger.info("Process complete. Exiting.")
