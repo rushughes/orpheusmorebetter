@@ -196,7 +196,7 @@ Listing missing transcodes (`orpheusmissing`)
 It shares the same configuration file as `orpheusmorebetter` (`~/.orpheusmorebetter/config`), so no extra setup is needed. It only reads from the API — it does not touch your local FLACs, `data_dir`, or any external tools (`lame`, `sox`, etc.).
 
 ```bash
-usage: orpheusmissing [-h] [--config CONFIG] [--cache CACHE] [--no-cache]
+usage: orpheusmissing [-h] [--config CONFIG]
                       [-m MODE] [--formats FORMATS] [--media MEDIA]
                       [-o OUTPUT] [--format-out {text,urls,csv}] [-t TOTP]
                       [--version] [-d]
@@ -208,7 +208,8 @@ Key options:
  - `--format-out` — `text` (default, human-readable), `csv`, or `urls` (one release URL per line).
  - `-o, --output` — write the report to a file instead of stdout (progress still goes to stderr).
  - `--formats` / `--media` — override the config values for this run.
- - `--cache` — location of the report cache. This is a **separate** cache from the transcode tool's (default `~/.orpheusmorebetter/report_cache`), so listing releases never marks them as "processed" for `orpheusmorebetter`. Use `--no-cache` to re-check everything.
+
+`orpheusmissing` does **not** cache: every run performs a full scan and reports the current state, so a release that is missing a format now will always show up (unlike a cache that would hide anything it had examined on a previous run). This means each run re-fetches your history and is rate-limited, so a large history takes a little while.
 
 The `urls` output format is designed to feed straight back into `orpheusmorebetter`, which accepts a file of release URLs:
 

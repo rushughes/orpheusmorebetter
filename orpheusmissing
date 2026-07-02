@@ -16,7 +16,6 @@ import argparse
 import configparser
 import logging
 import os
-import pickle
 import sys
 from datetime import datetime
 
@@ -54,17 +53,6 @@ def main():
         "--config",
         help="the location of the configuration file",
         default=os.path.expanduser("~/.orpheusmorebetter/config"),
-    )
-    parser.add_argument(
-        "--cache",
-        help="the location of the report cache (kept separate from the "
-        "transcode tool's cache so it never marks releases as processed)",
-        default=os.path.expanduser("~/.orpheusmorebetter/report_cache"),
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="ignore the cache: re-check every release and don't record results",
     )
     parser.add_argument(
         "-m",
@@ -156,37 +144,19 @@ def main():
     logger.info("Logging in to Orpheus Network...")
     api = whatapi.WhatAPI(username, password, endpoint, args.totp)
 
-    # ---- cache ----------------------------------------------------------
-    seen: set[str] = set()
-    if not args.no_cache:
-        try:
-            with open(args.cache, "rb") as f:
-                seen = pickle.load(f)
-        except OSError:
-            logger.info("Report cache not found, starting fresh.")
-
-    skip = None if args.no_cache else seen
-
     # ---- scan -----------------------------------------------------------
+    # No caching: this is a report of the CURRENT state, so every run does a
+    # full scan. (Caching "already examined" releases would hide anything that
+    # is missing now but was complete on a previous run.)
     logger.info(
         "Scanning %s history for releases missing: %s",
         args.mode,
         ", ".join(sorted(f.long_name or f.name for f in requested_formats)),
     )
 
-    record = None if args.no_cache else (lambda tid: seen.add(str(tid)))
-
-    items = []
-    try:
-        for item in report.find_missing(
-            api, args.mode, supported_media, requested_formats,
-            skip=skip, on_examined=record,
-        ):
-            items.append(item)
-    finally:
-        if not args.no_cache:
-            with open(args.cache, "wb") as f:
-                pickle.dump(seen, f)
+    items = list(
+        report.find_missing(api, args.mode, supported_media, requested_formats)
+    )
 
     # ---- render ---------------------------------------------------------
     rendered = report.RENDERERS[args.format_out](items)
