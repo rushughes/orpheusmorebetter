@@ -174,7 +174,9 @@ Some lossless releases ship their audio in a non-FLAC container -- for example F
 
 When the source directory has no `.flac` files, orpheusmorebetter now probes the other files with `ffmpeg`/`ffprobe` and, if it finds **lossless** audio (FLAC or ALAC) in a container like `.m4a`, it losslessly remuxes them to FLAC in a temporary directory, transcodes from there, and deletes the temporary FLACs afterward. Cover art and other sidecar files are carried along. Lossy sources (e.g. AAC) are never remuxed.
 
-This requires `ffmpeg`. Pass `--no-remux` to disable the behavior and keep the original "no FLAC files" skip.
+Relatedly, some FLAC releases have non-standard **ID3 tags** bolted onto them (an `ID3` header and/or a trailing `TAG` block). These are invalid in FLAC and make the `flac` decoder fail with `LOST_SYNC`, even though the audio is fine. When orpheusmorebetter detects such files it stages a temporary, cleaned copy of the release (re-encoding the tainted FLACs losslessly with `ffmpeg` and symlinking the rest), transcodes from there, and cleans up afterward. The original seeded files are never modified.
+
+Both behaviors require `ffmpeg`. Pass `--no-remux` to disable them.
 
 Disambiguating editions (`--edition`)
 -------------------------------------

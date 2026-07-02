@@ -136,6 +136,53 @@ def find_remuxable(source_dir: str) -> list[str]:
     return sorted(remuxable)
 
 
+def _encode_to_flac(src: str, out_path: str) -> None:
+    """Losslessly (re-)encode src to a clean, standard FLAC at out_path using
+    ffmpeg. Used both to remux non-FLAC containers and to strip junk (e.g. ID3
+    tags) from FLACs that the flac CLI can't decode. The audio samples are
+    preserved, so there is no quality loss."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    command = [
+        "ffmpeg", "-nostdin", "-v", "error", "-y",
+        "-i", src,
+        "-map", "0:a",
+        "-c:a", "flac", "-compression_level", "8",
+        "-map_metadata", "0",
+        out_path,
+    ]
+    try:
+        subprocess.check_output(command, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        raise TranscodeException(
+            "ffmpeg is required to prepare non-standard sources but was not found"
+        )
+    except subprocess.CalledProcessError as e:
+        raise TranscodeException(
+            'Preparing "{0}" with ffmpeg failed: {1}'.format(src, e.output)
+        )
+
+
+def _stage_link(src: str, dst: str) -> None:
+    """Make src available at dst cheaply: symlink if possible, else copy."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.symlink(os.path.abspath(src), dst)
+    except OSError:
+        shutil.copy(src, dst)
+
+
+def _copy_sidecars(source_dir: str, dest_dir: str, link: bool = False) -> None:
+    """Bring sidecar files (cover art, logs, cue sheets, ...) into dest_dir."""
+    for side in locate(source_dir, ext_matcher(*SIDECAR_EXTENSIONS)):
+        rel = os.path.relpath(side, source_dir)
+        dst = os.path.join(dest_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if link:
+            _stage_link(side, dst)
+        else:
+            shutil.copy(side, dst)
+
+
 def remux_to_flac(files: list[str], source_dir: str, dest_dir: str) -> list[str]:
     """Losslessly remux the given container files to FLAC under dest_dir,
     preserving their relative layout and copying over sidecar files (art, logs)
@@ -148,35 +195,55 @@ def remux_to_flac(files: list[str], source_dir: str, dest_dir: str) -> list[str]
     for f in files:
         rel = os.path.relpath(f, source_dir)
         out_path = os.path.join(dest_dir, os.path.splitext(rel)[0] + ".flac")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        command = [
-            "ffmpeg", "-nostdin", "-v", "error", "-y",
-            "-i", f,
-            "-map", "0:a",
-            "-c:a", "flac", "-compression_level", "8",
-            "-map_metadata", "0",
-            out_path,
-        ]
-        try:
-            subprocess.check_output(command, stderr=subprocess.STDOUT)
-        except FileNotFoundError:
-            raise TranscodeException(
-                "ffmpeg is required to remux non-FLAC sources but was not found"
-            )
-        except subprocess.CalledProcessError as e:
-            raise TranscodeException(
-                'Remux of "{0}" failed: {1}'.format(f, e.output)
-            )
+        _encode_to_flac(f, out_path)
         outputs.append(out_path)
 
-    # Carry sidecar files (cover art, logs, cue sheets, ...) alongside.
-    for side in locate(source_dir, ext_matcher(*SIDECAR_EXTENSIONS)):
-        rel = os.path.relpath(side, source_dir)
-        dst = os.path.join(dest_dir, rel)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy(side, dst)
-
+    _copy_sidecars(source_dir, dest_dir)
     return outputs
+
+
+def flac_has_id3(path: str) -> bool:
+    """Return True if a FLAC file carries non-standard ID3 tags -- an ID3v2
+    header at the start or an ID3v1 tag at the end. Such tags are invalid in
+    FLAC and make the flac CLI decoder fail with LOST_SYNC at end of stream,
+    even though the audio itself is fine."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(3) == b"ID3":
+                return True
+            f.seek(-128, os.SEEK_END)
+            if f.read(3) == b"TAG":
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def find_id3_flacs(source_dir: str) -> list[str]:
+    """Find .flac files under source_dir that carry ID3 tags (and so won't
+    decode with the flac CLI)."""
+    return sorted(
+        f for f in locate(source_dir, ext_matcher(".flac")) if flac_has_id3(f)
+    )
+
+
+def sanitize_flac_dir(source_dir: str, dest_dir: str) -> list[str]:
+    """Stage a copy of a FLAC release under dest_dir with ID3-tainted files
+    cleaned. ID3-tainted FLACs are re-encoded to clean FLAC with ffmpeg;
+    already-clean FLACs (and sidecar files) are symlinked to avoid copying.
+    The original files are never modified. Returns the cleaned FLAC paths."""
+    cleaned: list[str] = []
+    for f in locate(source_dir, ext_matcher(".flac")):
+        rel = os.path.relpath(f, source_dir)
+        out_path = os.path.join(dest_dir, rel)
+        if flac_has_id3(f):
+            _encode_to_flac(f, out_path)
+            cleaned.append(out_path)
+        else:
+            _stage_link(f, out_path)
+
+    _copy_sidecars(source_dir, dest_dir, link=True)
+    return cleaned
 
 
 def is_24bit(flac_dir: str) -> bool:

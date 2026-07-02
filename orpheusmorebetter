@@ -195,8 +195,9 @@ def main():
     parser.add_argument(
         "--no-remux",
         action="store_true",
-        help="don't auto-remux non-FLAC lossless sources (e.g. FLAC/ALAC "
-        "inside .m4a) to FLAC before transcoding",
+        help="don't auto-prepare non-standard sources before transcoding: "
+        "remuxing non-FLAC lossless audio (e.g. FLAC/ALAC inside .m4a) and "
+        "cleaning FLACs with junk ID3 tags",
     )
     parser.add_argument("-d", "--debug", action="store_true")
 
@@ -465,29 +466,48 @@ def main():
         if (flac_dir != cleaned_flac_dir):
             logger.warning(f'This OPH folder name has hidden characters. You may be able to re-upload this manually and trump the original.')
 
-        # If the source has no FLAC files but contains lossless audio in another
-        # container (e.g. FLAC/ALAC inside .m4a), remux to real FLACs in a temp
-        # staging directory and transcode from there. The staging directory is
-        # removed once the release has been processed (see finally below).
+        # Prepare a clean source in a temp staging directory when the release
+        # isn't directly transcodable, and transcode from there instead. Two
+        # cases are handled, both leaving the original (seeded) files untouched:
+        #   1. No FLAC files, but lossless audio in another container (e.g.
+        #      FLAC/ALAC inside .m4a) -> remux to real FLACs.
+        #   2. FLAC files that carry non-standard ID3 tags, which make the flac
+        #      CLI fail with LOST_SYNC -> re-encode clean copies (clean files
+        #      are symlinked, so only the tainted ones are rewritten).
+        # The staging directory is removed once the release is done (finally).
         staging_dir = None
-        if not args.no_remux and not any(
-            transcode.locate(flac_dir, transcode.ext_matcher(".flac"))
-        ):
-            remuxable = transcode.find_remuxable(flac_dir)
-            if remuxable:
-                logger.info(
-                    "  No FLAC files found; remuxing {0} lossless file(s) to FLAC...".format(
-                        len(remuxable)
+        if not args.no_remux:
+            if not any(transcode.locate(flac_dir, transcode.ext_matcher(".flac"))):
+                remuxable = transcode.find_remuxable(flac_dir)
+                if remuxable:
+                    logger.info(
+                        "  No FLAC files found; remuxing {0} lossless file(s) to FLAC...".format(
+                            len(remuxable)
+                        )
                     )
-                )
-                staging_dir = tempfile.mkdtemp(prefix="omb_remux_")
-                try:
-                    transcode.remux_to_flac(remuxable, flac_dir, staging_dir)
-                except Exception as e:
-                    logger.error("  Remux failed - skipping: {0}".format(e))
-                    shutil.rmtree(staging_dir, ignore_errors=True)
-                    continue
-                flac_dir = staging_dir
+                    staging_dir = tempfile.mkdtemp(prefix="omb_remux_")
+                    try:
+                        transcode.remux_to_flac(remuxable, flac_dir, staging_dir)
+                    except Exception as e:
+                        logger.error("  Remux failed - skipping: {0}".format(e))
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+                        continue
+                    flac_dir = staging_dir
+            else:
+                dirty = transcode.find_id3_flacs(flac_dir)
+                if dirty:
+                    logger.info(
+                        "  {0} FLAC file(s) have ID3 tags that break decoding; "
+                        "staging cleaned copies...".format(len(dirty))
+                    )
+                    staging_dir = tempfile.mkdtemp(prefix="omb_clean_")
+                    try:
+                        transcode.sanitize_flac_dir(flac_dir, staging_dir)
+                    except Exception as e:
+                        logger.error("  Cleaning failed - skipping: {0}".format(e))
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+                        continue
+                    flac_dir = staging_dir
 
         try:
             if int(do_24_bit):
