@@ -16,13 +16,31 @@ def _silence(path):
     ])
 
 
-class TestValidFractionalTag:
-    def test_accepts_plain_and_fraction(self):
-        assert tagging.valid_fractional_tag("42")
-        assert tagging.valid_fractional_tag("42/80")
-
-    def test_rejects_double_total(self):
-        assert not tagging.valid_fractional_tag("42/80/80")
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1", True),
+        ("A", False),
+        ("01", True),
+        ("A1", True),
+        ("1A", False),
+        ("AA1", False),
+        ("A01", True),
+        ("1/12", True),
+        ("A/12", False),
+        ("01/12", True),
+        ("A1/12", True),
+        ("a1/12", True),
+        ("1A/12", False),
+        ("Z9/10", True),
+        ("B02/03", True),
+        ("AA1/12", False),
+        ("42/80", True),
+        ("42/80/80", False),
+    ],
+)
+def test_valid_fractional_tag(value, expected):
+    assert tagging.valid_fractional_tag(value) is expected
 
 
 @pytest.mark.skipif(not FFMPEG, reason="ffmpeg not available")
