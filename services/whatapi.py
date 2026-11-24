@@ -37,6 +37,7 @@ TORRENTGROUP_WINDOW_SEC = 60.0
 RATE_LIMIT_ERROR = "Rate limit exceeded"
 RATE_LIMIT_ATTEMPTS = 3
 RATE_LIMIT_PAUSE_SEC = 60.0
+CONNECTION_ATTEMPTS = 3
 
 class WhatAPI:
     def __init__(
@@ -132,6 +133,32 @@ class WhatAPI:
         self._wait_for_slot(action)
         self._note_request(action)
 
+    def _send_ajax(
+        self,
+        method: Literal["POST", "GET"],
+        url: str,
+        params: dict[str, Any],
+        data: dict[str, str | int] | None,
+        files: Any,
+    ):
+        """Send one ajax call, replacing a socket the server already closed."""
+        for attempt in range(1, CONNECTION_ATTEMPTS + 1):
+            try:
+                if method == "GET":
+                    return self.session.get(url, params=params)
+                return self.session.post(
+                    url, params=params, data=data, files=files
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                self.session.close()
+                if attempt == CONNECTION_ATTEMPTS:
+                    raise RequestException("connection failed") from exc
+                LOGGER.info(
+                    "Connection dropped; retrying in %.0f seconds",
+                    MIN_REQUEST_GAP_SEC,
+                )
+                time.sleep(MIN_REQUEST_GAP_SEC)
+
     def request_ajax(
         self,
         action: str,
@@ -152,11 +179,9 @@ class WhatAPI:
             self._acquire(action)
             if method == "GET":
                 params.update({"auth": self.authkey})
-                r = self.session.get(ajaxpage, params=params)
-            elif method == "POST":
-                if data is not None:
-                    data.update({"auth": self.authkey})
-                r = self.session.post(ajaxpage, params=params, data=data, files=files)
+            elif method == "POST" and data is not None:
+                data.update({"auth": self.authkey})
+            r = self._send_ajax(method, ajaxpage, params, data, files)
 
             try:
                 LOGGER.debug(f"Received response with status code {r.status_code}")
@@ -175,6 +200,7 @@ class WhatAPI:
                     RATE_LIMIT_PAUSE_SEC,
                 )
                 time.sleep(RATE_LIMIT_PAUSE_SEC)
+                self.session.close()
                 continue
             raise RequestException(error)
 

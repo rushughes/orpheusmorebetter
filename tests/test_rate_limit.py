@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from models.exceptions import RequestException
 from services import whatapi
@@ -28,17 +29,27 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, payloads: list[dict]):
+    def __init__(self, payloads: list):
         self.payloads = list(payloads)
         self.calls: list[tuple] = []
+        self.events: list[str] = []
+
+    def _next(self, kind: str, url, params, data=None):
+        self.calls.append((kind, url, params, data))
+        self.events.append(kind)
+        item = self.payloads.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return FakeResponse(item)
 
     def get(self, url, params=None):
-        self.calls.append(("GET", url, params))
-        return FakeResponse(self.payloads.pop(0))
+        return self._next("get", url, params)
 
     def post(self, url, params=None, data=None, files=None):
-        self.calls.append(("POST", url, params, data))
-        return FakeResponse(self.payloads.pop(0))
+        return self._next("post", url, params, data)
+
+    def close(self):
+        self.events.append("close")
 
 
 def success(response=None):
@@ -106,7 +117,7 @@ def test_index_rate_limit_pauses_for_sixty_seconds(monkeypatch):
 
     assert api.request_ajax("index", method="GET") == {"id": 7}
     assert clock.sleeps == [whatapi.RATE_LIMIT_PAUSE_SEC]
-    assert len(session.calls) == 2
+    assert session.events == ["get", "close", "get"]
 
 
 def test_torrentgroup_rate_limit_pauses_for_the_minute_window(monkeypatch):
@@ -135,3 +146,16 @@ def test_rate_limit_gives_up_after_three_attempts(monkeypatch):
         whatapi.RATE_LIMIT_PAUSE_SEC,
     ]
     assert len(session.calls) == 3
+
+
+def test_dropped_connection_is_retried(monkeypatch):
+    clock = Clock()
+    install_clock(monkeypatch, clock)
+    api, session = make_api([
+        requests.ConnectionError("Remote end closed connection without response"),
+        success({"id": 7}),
+    ])
+
+    assert api.request_ajax("index", method="GET") == {"id": 7}
+    assert clock.sleeps == [whatapi.MIN_REQUEST_GAP_SEC]
+    assert session.events == ["get", "close", "get"]
