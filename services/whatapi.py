@@ -26,15 +26,17 @@ lossless_media = set(media_search_map.keys())
 
 LOGGER = logging.getLogger("api")
 
-# Gazelle asks for no more than 5 requests every 10 seconds. torrentgroup is
-# capped at 15 per 60 seconds on a counter shared with every other client on
-# this account, and a rejected call still increments it. Stay under both.
+# Gazelle's ajax limiter is one per-user counter, not a sliding window. A
+# rejected call still increments it, and the key can live for 60 seconds.
+# Stay under the published caps and never release a burst when a window opens.
 MAX_REQUESTS_PER_WINDOW = 4
 REQUEST_WINDOW_SEC = 10.0
+MIN_REQUEST_GAP_SEC = 5.0
 MAX_TORRENTGROUP_PER_WINDOW = 10
 TORRENTGROUP_WINDOW_SEC = 60.0
 RATE_LIMIT_ERROR = "Rate limit exceeded"
 RATE_LIMIT_ATTEMPTS = 3
+RATE_LIMIT_PAUSE_SEC = 60.0
 
 class WhatAPI:
     def __init__(
@@ -96,8 +98,15 @@ class WhatAPI:
                 t for t in self._request_times if now - t < REQUEST_WINDOW_SEC
             )
             wait = 0.0
+            if self._request_times:
+                gap_wait = MIN_REQUEST_GAP_SEC - (now - self._request_times[-1])
+                if gap_wait > 0:
+                    wait = gap_wait
             if len(self._request_times) >= MAX_REQUESTS_PER_WINDOW:
-                wait = REQUEST_WINDOW_SEC - (now - self._request_times[0])
+                wait = max(
+                    wait,
+                    REQUEST_WINDOW_SEC - (now - self._request_times[0]),
+                )
             if action == "torrentgroup":
                 self._torrentgroup_times = sorted(
                     t
@@ -160,17 +169,12 @@ class WhatAPI:
 
             error = parsed["error"]
             if error == RATE_LIMIT_ERROR and attempt < RATE_LIMIT_ATTEMPTS:
-                pause = (
-                    TORRENTGROUP_WINDOW_SEC
-                    if action == "torrentgroup"
-                    else REQUEST_WINDOW_SEC
-                )
                 LOGGER.info(
                     "Rate limit exceeded on %s; pausing for %.0f seconds",
                     action,
-                    pause,
+                    RATE_LIMIT_PAUSE_SEC,
                 )
-                time.sleep(pause)
+                time.sleep(RATE_LIMIT_PAUSE_SEC)
                 continue
             raise RequestException(error)
 

@@ -65,17 +65,16 @@ def install_clock(monkeypatch, clock: Clock) -> None:
     monkeypatch.setattr(whatapi.time, "sleep", clock.sleep)
 
 
-def test_second_call_waits_until_ten_second_window_has_room(monkeypatch):
+def test_calls_closer_than_five_seconds_are_held_apart(monkeypatch):
     clock = Clock()
     install_clock(monkeypatch, clock)
     api, session = make_api([success(), success()])
-    api._request_times = [clock.now, clock.now, clock.now]
 
     api.request_ajax("index", method="GET")
     assert clock.sleeps == []
 
     api.request_ajax("index", method="GET")
-    assert clock.sleeps == [whatapi.REQUEST_WINDOW_SEC]
+    assert clock.sleeps == [whatapi.MIN_REQUEST_GAP_SEC]
     assert len(session.calls) == 2
 
 
@@ -97,7 +96,7 @@ def test_torrentgroup_waits_until_sixty_second_window_has_room(monkeypatch):
     assert len(session.calls) == 2
 
 
-def test_rate_limit_is_retried_after_backoff(monkeypatch):
+def test_index_rate_limit_pauses_for_sixty_seconds(monkeypatch):
     clock = Clock()
     install_clock(monkeypatch, clock)
     api, session = make_api([
@@ -105,8 +104,8 @@ def test_rate_limit_is_retried_after_backoff(monkeypatch):
         success({"id": 7}),
     ])
 
-    assert api.request_ajax("user", method="GET") == {"id": 7}
-    assert clock.sleeps == [whatapi.REQUEST_WINDOW_SEC]
+    assert api.request_ajax("index", method="GET") == {"id": 7}
+    assert clock.sleeps == [whatapi.RATE_LIMIT_PAUSE_SEC]
     assert len(session.calls) == 2
 
 
@@ -119,7 +118,7 @@ def test_torrentgroup_rate_limit_pauses_for_the_minute_window(monkeypatch):
     ])
 
     assert api.request_ajax("torrentgroup", id=418678) == {"group": {"id": 1}}
-    assert clock.sleeps == [whatapi.TORRENTGROUP_WINDOW_SEC]
+    assert clock.sleeps == [whatapi.RATE_LIMIT_PAUSE_SEC]
     assert len(session.calls) == 2
 
 
@@ -132,7 +131,7 @@ def test_rate_limit_gives_up_after_three_attempts(monkeypatch):
         api.request_ajax("user", method="GET")
 
     assert clock.sleeps == [
-        whatapi.REQUEST_WINDOW_SEC,
-        whatapi.REQUEST_WINDOW_SEC,
+        whatapi.RATE_LIMIT_PAUSE_SEC,
+        whatapi.RATE_LIMIT_PAUSE_SEC,
     ]
     assert len(session.calls) == 3
