@@ -60,6 +60,7 @@ mode = both
 source = OPS
 remote_host =
 remote_path =
+missing_cache =
 ```
 
 If you have used `orpheusbetter`, `whatbetter`, or `redbetter`, this is an extremely similar config format.
@@ -98,6 +99,14 @@ If you have used `orpheusbetter`, `whatbetter`, or `redbetter`, this is an extre
 
  `source` is the source flag to add to created torrents. Leave blank if you are running `mktorrent` 1.0.
 
+`missing_cache` is an optional SQLite file used by `orpheusmissing`. Leave it blank to rescan every album on every run. Set it to a path on the shared media volume so both machines skip albums already confirmed complete:
+
+```
+missing_cache = /Volumes/media/orpheus/orpheusmissing.sqlite
+```
+
+Albums that are still missing a requested format are looked up again each run. One machine should run `orpheusmissing` at a time; the database uses SQLite's rollback journal rather than WAL because the file lives on a network share.
+
 You should end up with something like this:
 
 ```
@@ -116,6 +125,7 @@ mode = both
 source = OPS
 remote_host =
 remote_path =
+missing_cache = /Volumes/media/orpheus/orpheusmissing.sqlite
 ```
 
 Usage
@@ -214,34 +224,36 @@ The label is injected into the edition segment and overrides the release's own r
 Listing missing transcodes (`orpheusmissing`)
 ----------------------------------------------
 
-`orpheusmissing` is a read-only companion command. It scans your Orpheus history and reports which FLAC releases are **missing** an MP3 V0 and/or 320 transcode — without transcoding or uploading anything. Use it to see your backlog before committing to a (potentially long) transcode run.
+`orpheusmissing` scans your Orpheus history for FLAC releases **missing** an MP3 V0 and/or 320 transcode, and runs `orpheusmorebetter` on each one as soon as it is found. The transcoder creates the files, builds the torrents, uploads them, and drops the torrent files in the watch directory, using the same config as a manual run. The history crawl continues after that release finishes.
 
-It shares the same configuration file as `orpheusmorebetter` (`~/.orpheusmorebetter/config`), so no extra setup is needed. It only reads from the API — it does not touch your local FLACs, `data_dir`, or any external tools (`lame`, `sox`, etc.).
+It shares the configuration file (`~/.orpheusmorebetter/config`). The scan itself only reads the API. `orpheusmorebetter` then uses `data_dir`, `output_dir`, `torrent_dir`, and `remote_host` / `remote_path` exactly as it would if you passed it the URL list yourself.
 
 ```bash
 usage: orpheusmissing [-h] [--config CONFIG]
                       [-m MODE] [--formats FORMATS] [--media MEDIA]
-                      [-o OUTPUT] [--format-out {text,urls,csv}] [-t TOTP]
-                      [--version] [-d]
+                      [-o OUTPUT] [--format-out {text,urls,csv}] [--refresh]
+                      [--report-only] [-t TOTP] [--version] [-d]
 ```
 
 Key options:
 
  - `-m, --mode` — which history to scan: `snatched` (default; things you've downloaded), `uploaded`, `both`, `seeding`, or `all`.
- - `--format-out` — `text` (default, human-readable), `csv`, or `urls` (one release URL per line).
- - `-o, --output` — write the report to a file instead of stdout (progress still goes to stderr).
+ - `--report-only` — list the backlog and stop, without transcoding or uploading. `--format-out` and `-o` apply to this list.
+ - `--format-out` — with `--report-only`: `text` (default, human-readable), `csv`, or `urls` (one release URL per line).
+ - `-o, --output` — with `--report-only`, write the report to a file instead of stdout (progress still goes to stderr).
  - `--formats` / `--media` — override the config values for this run.
+ - `--refresh` — look up albums already marked complete and rewrite those cache rows. Use this when a format disappears from a release that was previously complete.
 
-`orpheusmissing` does **not** cache: every run performs a full scan and reports the current state, so a release that is missing a format now will always show up (unlike a cache that would hide anything it had examined on a previous run). This means each run re-fetches your history and is rate-limited, so a large history takes a little while.
+When `missing_cache` is set, albums confirmed complete for the current format set are not fetched again. Albums still missing a format are fetched on every run, and if the formats are now present the row is marked complete. A successful upload stays in the missing list until the next scan sees the new formats on the tracker. The history pages are still walked, so newly snatched releases are found. With the cache blank, every run fetches every album. The per-album lookup is rate-limited, so the first scan of a large history takes a while.
 
-The `urls` output format is designed to feed straight back into `orpheusmorebetter`, which accepts a file of release URLs:
+A plain run with nothing missing prints the empty report and does not start the transcoder. Each missing release starts its own `orpheusmorebetter` as soon as the scan finds it. A release that fails is logged, and the scan continues with the next one. `--report-only` is the manual version of that handoff:
 
 ```bash
-# 1. Discover everything you've snatched that's missing a V0/320
-orpheusmissing -m snatched --format-out urls -o backlog.txt
+# List the backlog without uploading
+orpheusmissing --report-only -m snatched --format-out urls -o backlog.txt
 
-# 2. Transcode and upload the whole backlog
+# Same work the default command does for you
 orpheusmorebetter backlog.txt
 ```
 
-Note: `orpheusmissing` is purely API-based, so it cannot detect 24-bit or multichannel releases (those checks need the local FLAC). A small number of releases in the URL list may therefore be skipped by `orpheusmorebetter` when it inspects the actual files — this is expected.
+`orpheusmissing` cannot detect 24-bit or multichannel releases during the scan (those checks need the local FLAC). `orpheusmorebetter` still skips those when it opens the files.

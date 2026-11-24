@@ -283,6 +283,7 @@ def main():
         config.set("orpheus", "source", "OPS")
         config.set("orpheus", "remote_host", "")
         config.set("orpheus", "remote_path", "")
+        config.set("orpheus", "missing_cache", "")
         config.write(open(args.config, "w"))
         logger.warning("Please edit the configuration file: {0}".format(args.config))
         sys.exit(2)
@@ -347,6 +348,14 @@ def main():
             config.set("orpheus", "api", "https://orpheus.network/")
             config.write(open(args.config, "w"))
             logger.info("API endpoint set to https://orpheus.network/")
+        if not config.has_option("orpheus", "missing_cache"):
+            config.set("orpheus", "missing_cache", "")
+            config.write(open(args.config, "w"))
+            logger.info(
+                "missing_cache added to config file. Set it to a path on the "
+                "shared media volume to skip albums orpheusmissing has already "
+                "confirmed complete."
+            )
 
         tracker = config.get("orpheus", "tracker")
         if not tracker.endswith('/'):

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""orpheusmissing -- list FLAC releases in your history missing V0/320 MP3s.
+"""orpheusmissing -- transcode FLAC releases missing V0/320 MP3s.
 
-A read-only, discovery-only companion to ``orpheusmorebetter``. It scans your
-Orpheus history (snatched by default) and reports which FLAC releases are
-missing an MP3 V0 and/or 320 transcode. It never transcodes or uploads.
+Scans your Orpheus history (snatched by default) for FLAC releases missing an
+MP3 V0 and/or 320 transcode, and runs ``orpheusmorebetter`` on each one as
+soon as it is found. The transcodes, torrents, and uploads happen as they
+would from the command itself.
 
-Output can be a human report (default), CSV, or a plain URL list that can be fed
-straight back into the transcoder:
+``--report-only`` lists the backlog and stops, which is the manual handoff:
 
-    orpheusmissing --format-out urls -o backlog.txt
+    orpheusmissing --report-only --format-out urls -o backlog.txt
     orpheusmorebetter backlog.txt
 """
 
@@ -16,13 +16,16 @@ import argparse
 import configparser
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 from datetime import datetime
 
 from _version import __version__
 
 from services import whatapi
 from services import report
+from services.missing_cache import MissingCache, formats_key
 import models.format as formats
 
 if sys.version_info < (3, 10, 0):
@@ -40,6 +43,57 @@ def parse_requested_formats(formats_str: str) -> set:
         elif "V0" in cleaned:
             requested.add(formats.MP3_V0)
     return requested
+
+
+def launch_transcoder(items, config_path: str, totp: str | None = None, runner=None):
+    """Run orpheusmorebetter on the permalinks in ``items``.
+
+    Writes one permalink per line to a temp file, then invokes the
+    orpheusmorebetter script beside this file with that file as its release
+    list. ``runner`` defaults to ``subprocess.run`` and is given the argv
+    list. Returns the child's exit code.
+    """
+    if runner is None:
+        runner = subprocess.run
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orpheusmorebetter")
+    fd, urlfile = tempfile.mkstemp(prefix="orpheusmissing-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            for item in items:
+                handle.write(f"{item.permalink}\n")
+        cmd = [sys.executable, script, "--config", config_path]
+        if totp:
+            cmd.extend(["-t", totp])
+        cmd.append(urlfile)
+        completed = runner(cmd)
+        return getattr(completed, "returncode", 0)
+    finally:
+        if os.path.exists(urlfile):
+            os.remove(urlfile)
+
+
+def transcode_as_found(items, config_path: str, totp: str | None = None, launch=None):
+    """Run the transcoder on each item as it is yielded.
+
+    A non-zero exit is logged and the rest of ``items`` is still processed.
+    Returns ``(count, failed)``.
+    """
+    if launch is None:
+        launch = launch_transcoder
+    logger = logging.getLogger("main")
+    count = 0
+    failed = 0
+    for item in items:
+        count += 1
+        logger.info("Transcoding %s", item.permalink)
+        code = launch([item], config_path, totp=totp)
+        if code:
+            failed += 1
+            logger.error(
+                "orpheusmorebetter exited %s for %s", code, item.permalink
+            )
+    return count, failed
 
 
 def main():
@@ -81,6 +135,16 @@ def main():
         choices=["text", "urls", "csv"],
         default="text",
         help="output format",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="recheck albums already marked complete and update the cache",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="list missing releases and do not transcode or upload",
     )
     parser.add_argument(
         "-t", "--totp", help="time based one time password for 2FA", default=None
@@ -144,32 +208,66 @@ def main():
     logger.info("Logging in to Orpheus Network...")
     api = whatapi.WhatAPI(username, password, endpoint, args.totp)
 
+    # ---- cache ----------------------------------------------------------
+    # Complete albums are skipped. Missing albums are fetched again so a
+    # transcode uploaded since the last run drops off the report.
+    cache = None
+    cache_path = config.get("orpheus", "missing_cache", fallback="").strip()
+    key = formats_key(requested_formats)
+    if cache_path:
+        try:
+            cache = MissingCache(os.path.expanduser(cache_path))
+        except OSError as e:
+            logger.error("Could not open missing_cache %s: %s", cache_path, e)
+            sys.exit(2)
+        logger.info("Using missing-transcode cache %s", cache.path)
+
     # ---- scan -----------------------------------------------------------
-    # No caching: this is a report of the CURRENT state, so every run does a
-    # full scan. (Caching "already examined" releases would hide anything that
-    # is missing now but was complete on a previous run.)
     logger.info(
         "Scanning %s history for releases missing: %s",
         args.mode,
         ", ".join(sorted(f.long_name or f.name for f in requested_formats)),
     )
 
-    items = list(
-        report.find_missing(api, args.mode, supported_media, requested_formats)
+    found = report.find_missing(
+        api,
+        args.mode,
+        supported_media,
+        requested_formats,
+        cache=cache,
+        formats_key=key,
+        refresh=args.refresh,
     )
+    try:
+        if args.report_only:
+            items = list(found)
+            count, failed = len(items), 0
+        else:
+            items = []
+            count, failed = transcode_as_found(
+                found, args.config, totp=args.totp
+            )
+    finally:
+        if cache is not None:
+            cache.close()
 
-    # ---- render ---------------------------------------------------------
-    rendered = report.RENDERERS[args.format_out](items)
+    # ---- report or transcode -------------------------------------------
+    if args.report_only or count == 0:
+        rendered = report.RENDERERS[args.format_out](items)
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(rendered)
+            logger.info("Wrote %d item(s) to %s", count, args.output)
+        else:
+            # report to stdout, distinct from the stderr progress log
+            sys.stdout.write(rendered)
+        logger.info("Done. %d release(s) missing requested formats.", count)
+        return
 
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(rendered)
-        logger.info("Wrote %d item(s) to %s", len(items), args.output)
-    else:
-        # report to stdout, distinct from the stderr progress log
-        sys.stdout.write(rendered)
-
-    logger.info("Done. %d release(s) missing requested formats.", len(items))
+    if failed:
+        logger.error("%d of %d release(s) failed to transcode.", failed, count)
+        sys.exit(1)
+    logger.info("Done. Transcoded %d release(s).", count)
 
 
 if __name__ == "__main__":

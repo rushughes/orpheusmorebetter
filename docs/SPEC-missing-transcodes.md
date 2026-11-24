@@ -128,10 +128,10 @@ limit makes streaming output important for UX on large histories).
 
 ### 3.3 CLI behavior
 ```
-orpheusmissing [--config PATH] [--cache PATH]
+orpheusmissing [--config PATH]
                [-m MODE] [--media ...] [--formats v0,320]
                [-o OUTPUT] [--format-out {text,csv,urls}]
-               [--no-cache] [-t TOTP]
+               [--refresh] [-t TOTP]
 ```
 - Reuses the existing config file (`~/.orpheusmorebetter/config`) for
   credentials, api endpoint, `media`, `formats`, `mode`.
@@ -173,10 +173,13 @@ $ orpheusmorebetter backlog.txt   # transcode + upload the backlog
   document it. **Decided: no local checks in v1** (purely API-based).
 - **Rate limiting cost**: one `torrentgroup` ajax call per candidate at 5s each.
   A 500-item history ≈ 40+ minutes. Mitigations:
-  - Reuse the existing pickle **cache** (`--cache`) so re-runs skip seen ids.
-    Uses a **separate cache file by default**
-    (`~/.orpheusmorebetter/report_cache`) so it never poisons the transcode
-    tool's "seen" set. (Decided, §6.)
+  - A separate SQLite file, path set by the `missing_cache` config key (blank
+    disables it). Albums stored as **complete** for the current format set are
+    skipped on later runs. Albums still **missing** a format are fetched again
+    every run, and promoted to complete once the formats are present. This does
+    not use orpheusmorebetter's pickle "seen" set. `--refresh` rechecks
+    complete rows (a format removed from a complete release stays hidden until
+    then). History pages are still crawled so new snatches are found.
   - Print progress/results as they stream in.
 - **Local availability (optional column)**: could annotate each item with
   whether its FLAC exists in `data_dir` (so the user knows which are
@@ -208,9 +211,11 @@ All open questions are now decided:
 
 1. **Default mode → `snatched`** (your "download history"). Overridable with
    `-m` (`snatched` / `uploaded` / `both` / `seeding` / `all`).
-2. **Cache → separate report cache file**, default
-   `~/.orpheusmorebetter/report_cache`, so it never poisons the transcode
-   tool's "seen" set. Overridable with `--cache`.
+2. **Cache → `missing_cache` in the shared config**, blank by default. When
+   set (typically on the shared media volume, e.g.
+   `/Volumes/media/orpheus/orpheusmissing.sqlite`), complete torrents are
+   skipped and missing torrents are rechecked. `--refresh` rechecks complete
+   rows. The file is independent of the transcode tool's pickle cache.
 3. **Primary output → human-readable text report** (default). CSV and `urls`
    remain available via `--format-out` for chaining/spreadsheets, but `text` is
    the default and the main deliverable.

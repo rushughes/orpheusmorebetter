@@ -105,18 +105,38 @@ def find_missing(
     requested_formats: set[Format],
     skip: set[str] | None = None,
     on_examined: Callable[[int], None] | None = None,
+    cache=None,
+    formats_key: str | None = None,
+    refresh: bool = False,
 ) -> Iterator[MissingItem]:
     """Stream releases in the user's history that are missing requested formats.
 
     Reuses ``WhatAPI.get_candidates`` for the paginated crawl of the user's
     history, then for each FLAC candidate fetches its group and computes what's
     missing. Yields one ``MissingItem`` per release that is missing at least one
-    requested format. Purely API-based -- no local files touched.
+    requested format.
 
-    ``on_examined`` (if given) is called with every torrent id that was fully
-    examined -- whether or not it was missing anything -- so callers can record
-    it in a cache and skip re-fetching its (expensive) group on later runs.
+    When ``cache`` is a ``MissingCache`` and ``refresh`` is false, torrent ids
+    already stored as complete for ``formats_key`` are added to ``skip`` so
+    their group is not fetched again. Missing rows are not skipped: they are
+    fetched again and rewritten. ``refresh`` ignores stored complete ids and
+    rewrites every row that is examined. A group that fails to fetch is left
+    unchanged in the cache.
     """
+    if cache is not None and not formats_key:
+        raise ValueError("formats_key is required when cache is set")
+
+    if cache is not None and not refresh:
+        cached = cache.complete_ids(formats_key)
+        if cached:
+            LOGGER.info(
+                "Skipping %d complete release(s) already in the cache",
+                len(cached),
+            )
+        skip = cached if skip is None else set(skip) | cached
+    elif refresh:
+        LOGGER.info("Refreshing cache; rechecking releases marked complete")
+
     base = api.base_url.rstrip("/")
 
     for groupid, torrentid in api.get_candidates(mode, skip=skip, media=media):
@@ -135,13 +155,24 @@ def find_missing(
         torrent = matches[0]
 
         needed = formats_needed(group, torrent, requested_formats)
+        permalink = f"{base}/torrents.php?id={group.id}&torrentid={torrent.id}"
 
-        # Mark as examined regardless of outcome, so complete releases aren't
-        # re-fetched on the next run.
         if on_examined is not None:
             on_examined(torrentid)
 
         if not needed:
+            if cache is not None:
+                cache.mark_complete(
+                    torrent_id=torrent.id,
+                    group_id=group.id,
+                    formats_key=formats_key,
+                    artist=group.formatted_artist_string,
+                    group_name=group.name,
+                    year=group.year,
+                    media=torrent.media,
+                    edition=torrent.formatted_media_info,
+                    permalink=permalink,
+                )
             continue
 
         item = MissingItem(
@@ -153,8 +184,10 @@ def find_missing(
             media=torrent.media,
             edition=torrent.formatted_media_info,
             missing=needed,
-            permalink=f"{base}/torrents.php?id={group.id}&torrentid={torrent.id}",
+            permalink=permalink,
         )
+        if cache is not None:
+            cache.mark_missing(item, formats_key)
         LOGGER.info(
             "  Missing %s: %s - %s (%s) %s",
             ", ".join(item.missing_names),
