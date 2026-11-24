@@ -58,6 +58,8 @@ tracker = https://home.opsfet.ch/
 api = https://orpheus.network/
 mode = both
 source = OPS
+remote_host =
+remote_path =
 ```
 
 If you have used `orpheusbetter`, `whatbetter`, or `redbetter`, this is an extremely similar config format.
@@ -65,6 +67,8 @@ If you have used `orpheusbetter`, `whatbetter`, or `redbetter`, this is an extre
 `username` and `password` are your Orpheus login credentials.
 
 `data_dir` is the directory where your source FLACs are stored.
+
+`remote_host` and `remote_path` are optional. Set them when the files live on a Samba share mounted from a Linux server. `remote_host` is an SSH destination such as `rus@fileserver`. `remote_path` is `local_prefix=remote_prefix`, mapping the mount point to the directory on that server. Files the mount cannot open are copied over SSH into a temp directory, and the seeded originals are left unchanged. Torrents for transcodes written under that prefix are created on the server, so the names inside the torrent match the files on disk.
 
 `output_dir` is the directory where your transcodes will be stored after creation. If the value is blank, `data_dir` will be used. You may also specify per format values such as `output_dir_320` or `output_dir_v0`, and `orpheusmorebetter` will redirect the outputs to the associated directory.
 
@@ -110,6 +114,8 @@ tracker = https://home.opsfet.ch/
 api = https://orpheus.network
 mode = both
 source = OPS
+remote_host =
+remote_path =
 ```
 
 Usage

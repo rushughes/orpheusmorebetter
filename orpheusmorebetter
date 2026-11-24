@@ -13,7 +13,6 @@ import tempfile
 import traceback
 import logging
 import html
-import unicodedata
 from urllib.parse import urlparse, parse_qsl
 from multiprocessing import cpu_count
 from typing import List
@@ -39,8 +38,7 @@ def _match_key(name: str) -> str:
     those characters or use a different normalization form. Stripping
     non-printable characters and normalizing to NFC lets both forms match.
     """
-    stripped = "".join(ch for ch in name if ch.isprintable())
-    return unicodedata.normalize("NFC", stripped)
+    return transcode.match_key(name)
 
 
 def resolve_existing_dir(base: str, rel: str) -> str | None:
@@ -250,6 +248,8 @@ def main():
         config.set("orpheus", "mode", "both")
         config.set("orpheus", "api", "https://orpheus.network/")
         config.set("orpheus", "source", "OPS")
+        config.set("orpheus", "remote_host", "")
+        config.set("orpheus", "remote_path", "")
         config.write(open(args.config, "w"))
         logger.warning("Please edit the configuration file: {0}".format(args.config))
         sys.exit(2)
@@ -330,6 +330,24 @@ def main():
         source = None
         if config.has_option("orpheus", "source"):
             source = config.get("orpheus", "source")
+
+        remote_host = config.get("orpheus", "remote_host", fallback="").strip()
+        remote_path = config.get("orpheus", "remote_path", fallback="").strip()
+        remote_share = None
+        if remote_host or remote_path:
+            if not remote_host or "=" not in remote_path:
+                logger.error(
+                    "remote_host and remote_path must both be set, "
+                    "as local_prefix=remote_prefix"
+                )
+                sys.exit(2)
+            local_prefix, remote_prefix = remote_path.split("=", 1)
+            local_prefix = os.path.expanduser(local_prefix.strip())
+            remote_prefix = remote_prefix.strip()
+            if not local_prefix or not remote_prefix:
+                logger.error("remote_path must be local_prefix=remote_prefix")
+                sys.exit(2)
+            remote_share = transcode.RemoteShare(remote_host, local_prefix, remote_prefix)
 
     upload_torrent = not args.no_upload
 
@@ -467,49 +485,67 @@ def main():
             logger.warning(f'This OPH folder name has hidden characters. You may be able to re-upload this manually and trump the original.')
 
         # Prepare a clean source in a temp staging directory when the release
-        # isn't directly transcodable, and transcode from there instead. Two
-        # cases are handled, both leaving the original (seeded) files untouched:
-        #   1. No FLAC files, but lossless audio in another container (e.g.
+        # isn't directly transcodable, and transcode from there instead.
+        # Seeded files are never modified. Cases:
+        #   1. A file the Samba mount lists but cannot open (NFD name on a
+        #      Linux disk) -> copy it over SSH; symlink the files that open.
+        #   2. No FLAC files, but lossless audio in another container (e.g.
         #      FLAC/ALAC inside .m4a) -> remux to real FLACs.
-        #   2. FLAC files that carry non-standard ID3 tags, which make the flac
+        #   3. FLAC files that carry non-standard ID3 tags, which make the flac
         #      CLI fail with LOST_SYNC -> re-encode clean copies (clean files
         #      are symlinked, so only the tainted ones are rewritten).
-        # The staging directory is removed once the release is done (finally).
-        staging_dir = None
-        if not args.no_remux:
-            if not any(transcode.locate(flac_dir, transcode.ext_matcher(".flac"))):
-                remuxable = transcode.find_remuxable(flac_dir)
-                if remuxable:
-                    logger.info(
-                        "  No FLAC files found; remuxing {0} lossless file(s) to FLAC...".format(
-                            len(remuxable)
-                        )
-                    )
-                    staging_dir = tempfile.mkdtemp(prefix="omb_remux_")
-                    try:
-                        transcode.remux_to_flac(remuxable, flac_dir, staging_dir)
-                    except Exception as e:
-                        logger.error("  Remux failed - skipping: {0}".format(e))
-                        shutil.rmtree(staging_dir, ignore_errors=True)
-                        continue
-                    flac_dir = staging_dir
-            else:
-                dirty = transcode.find_id3_flacs(flac_dir)
-                if dirty:
-                    logger.info(
-                        "  {0} FLAC file(s) have ID3 tags that break decoding; "
-                        "staging cleaned copies...".format(len(dirty))
-                    )
-                    staging_dir = tempfile.mkdtemp(prefix="omb_clean_")
-                    try:
-                        transcode.sanitize_flac_dir(flac_dir, staging_dir)
-                    except Exception as e:
-                        logger.error("  Cleaning failed - skipping: {0}".format(e))
-                        shutil.rmtree(staging_dir, ignore_errors=True)
-                        continue
-                    flac_dir = staging_dir
-
+        # Every temp directory is removed once the release is done (finally).
+        staging_dirs: list[str] = []
         try:
+            fetch_dir = tempfile.mkdtemp(prefix="omb_fetch_")
+            staging_dirs.append(fetch_dir)
+            try:
+                fetched = transcode.stage_unreadable(flac_dir, fetch_dir, remote_share)
+            except Exception as e:
+                logger.error("  {0} - skipping".format(e))
+                continue
+            if fetched:
+                logger.info(
+                    "  Staged files the share would not open; seeded files were left unchanged."
+                )
+                flac_dir = fetch_dir
+            else:
+                staging_dirs.remove(fetch_dir)
+                shutil.rmtree(fetch_dir, ignore_errors=True)
+
+            if not args.no_remux:
+                if not any(transcode.locate(flac_dir, transcode.ext_matcher(".flac"))):
+                    remuxable = transcode.find_remuxable(flac_dir)
+                    if remuxable:
+                        logger.info(
+                            "  No FLAC files found; remuxing {0} lossless file(s) to FLAC...".format(
+                                len(remuxable)
+                            )
+                        )
+                        staging_dir = tempfile.mkdtemp(prefix="omb_remux_")
+                        staging_dirs.append(staging_dir)
+                        try:
+                            transcode.remux_to_flac(remuxable, flac_dir, staging_dir)
+                        except Exception as e:
+                            logger.error("  Remux failed - skipping: {0}".format(e))
+                            continue
+                        flac_dir = staging_dir
+                else:
+                    dirty = transcode.find_id3_flacs(flac_dir)
+                    if dirty:
+                        logger.info(
+                            "  {0} FLAC file(s) have ID3 tags that break decoding; "
+                            "staging cleaned copies...".format(len(dirty))
+                        )
+                        staging_dir = tempfile.mkdtemp(prefix="omb_clean_")
+                        staging_dirs.append(staging_dir)
+                        try:
+                            transcode.sanitize_flac_dir(flac_dir, staging_dir)
+                        except Exception as e:
+                            logger.error("  Cleaning failed - skipping: {0}".format(e))
+                            continue
+                        flac_dir = staging_dir
+
             if int(do_24_bit):
                 try:
                     if (
@@ -591,7 +627,7 @@ def main():
                     try:
                         transcode_dir = transcode.transcode_release(flac_dir, local_output_dir, format, torrent, group, args.edition)
                         new_torrent = transcode.make_torrent(
-                            transcode_dir, tmpdir, tracker, api.passkey, source
+                            transcode_dir, tmpdir, tracker, api.passkey, source, remote_share
                         )
                         logger.info("      Transcode successful, torrent created")
                         if upload_torrent:
@@ -611,7 +647,7 @@ def main():
                     logger.error("    Path not found - skipping: {0}".format(flac_dir))
                     break
         finally:
-            if staging_dir is not None:
+            for staging_dir in staging_dirs:
                 shutil.rmtree(staging_dir, ignore_errors=True)
         seen.add(str(torrentid))
         pickle.dump(seen, open(args.cache, "wb"))

@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import os.path as path
 import re
@@ -6,11 +7,48 @@ import shlex
 import shutil
 import signal
 import subprocess
+import unicodedata
 
 from typing import Callable, Optional
 import logging
 
 LOGGER = logging.getLogger("transcode")
+
+
+def match_key(name: str) -> str:
+    """Normalize a filename so NFC and NFD spellings compare equal.
+
+    Invisible formatting characters are stripped, then the name is composed
+    to NFC. A Mac Samba client and the Linux disk often disagree on which
+    form a name is stored in; this key treats those forms as the same name.
+    """
+    stripped = "".join(ch for ch in name if ch.isprintable())
+    return unicodedata.normalize("NFC", stripped)
+
+
+class RemoteShare:
+    """SSH view of a Samba share, so names can be read as the server stores them."""
+
+    def __init__(self, host: str, local_prefix: str, remote_prefix: str):
+        self.host = host
+        self.local_prefix = os.path.abspath(local_prefix)
+        self.remote_prefix = remote_prefix.rstrip("/")
+
+    def remote_for(self, local_path: str) -> str | None:
+        """Map a local path under ``local_prefix`` to the remote prefix.
+
+        Returns None when ``local_path`` is outside the configured prefix.
+        The result still uses the local path's own spelling; call
+        ``resolve_remote_path`` for the name that exists on the server.
+        """
+        local_path = os.path.abspath(local_path)
+        prefix = self.local_prefix
+        if local_path != prefix and not local_path.startswith(prefix + os.sep):
+            return None
+        rel = os.path.relpath(local_path, prefix)
+        if rel == os.curdir:
+            return self.remote_prefix
+        return self.remote_prefix + "/" + "/".join(rel.split(os.sep))
 
 import mutagen.flac
 
@@ -634,11 +672,242 @@ def transcode_release(
         raise
 
 
-def make_torrent(input_dir: str, output_dir: str, tracker: str, passkey: str, source: str | None) -> str:
+# Runs on the server. Paths arrive on stdin as JSON so the remote shell never
+# parses combining characters, spaces, or braces. mktorrent is invoked with an
+# argument list, and its temp file is removed before the process exits.
+_REMOTE_SCRIPT = r"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+def fail(msg):
+    sys.stderr.write(str(msg) + "\n")
+    sys.exit(1)
+
+try:
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except Exception as exc:
+    fail("bad request: %s" % exc)
+
+op = req.get("op")
+try:
+    if op == "listdir":
+        names = os.listdir(req["path"])
+        sys.stdout.buffer.write(json.dumps(names, ensure_ascii=False).encode("utf-8"))
+    elif op == "cat":
+        with open(req["path"], "rb") as fh:
+            sys.stdout.buffer.write(fh.read())
+    elif op == "mktorrent":
+        # mktorrent will not overwrite an existing file, so the output path
+        # must not exist yet. The directory is removed before this process exits.
+        tmpdir = tempfile.mkdtemp(prefix="omb_")
+        tmp = os.path.join(tmpdir, "release.torrent")
+        payload = b""
+        try:
+            command = ["mktorrent", "-p", "-a", req["announce"], "-o", tmp, req["directory"]]
+            if req.get("source") is not None:
+                command = [
+                    "mktorrent", "-p", "-s", req["source"],
+                    "-a", req["announce"], "-o", tmp, req["directory"],
+                ]
+            try:
+                proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except FileNotFoundError:
+                fail("mktorrent was not found on the server")
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", "replace").strip()
+                fail(err or "mktorrent failed")
+            with open(tmp, "rb") as fh:
+                payload = fh.read()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+        sys.stdout.buffer.write(payload)
+    else:
+        fail("unknown op")
+except FileNotFoundError as exc:
+    fail(str(exc))
+except OSError as exc:
+    fail(str(exc))
+"""
+
+
+def ssh_exec(host: str, request: bytes) -> bytes:
+    """Run the remote helper on ``host``. ``request`` is the JSON payload on stdin."""
+    remote = "python3 -c " + shlex.quote(_REMOTE_SCRIPT)
+    try:
+        completed = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host, remote],
+            input=request,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise TranscodeException(
+            "ssh is required to read files from the remote share but was not found"
+        )
+    if completed.returncode != 0:
+        err = completed.stderr.decode("utf-8", "replace").strip()
+        detail = err or "exit {0}".format(completed.returncode)
+        raise TranscodeException('Remote command on {0} failed: {1}'.format(host, detail))
+    return completed.stdout
+
+
+def _remote_request(host: str, payload: dict) -> bytes:
+    return ssh_exec(host, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def remote_listdir(host: str, remote_dir: str) -> list[str]:
+    """Return the server's exact directory entries for ``remote_dir``."""
+    raw = _remote_request(host, {"op": "listdir", "path": remote_dir})
+    try:
+        names = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TranscodeException(
+            'Unexpected directory listing from {0}: {1}'.format(host, exc)
+        )
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise TranscodeException('Unexpected directory listing from {0}'.format(host))
+    return names
+
+
+def resolve_remote_path(share: RemoteShare, local_path: str) -> str:
+    """Return the on-server path for ``local_path``, spelling each component as stored."""
+    mapped = share.remote_for(local_path)
+    if mapped is None:
+        raise TranscodeException(
+            '"{0}" is outside the remote_path prefix {1}'.format(local_path, share.local_prefix)
+        )
+    if mapped == share.remote_prefix:
+        return mapped
+    rel = mapped[len(share.remote_prefix):].lstrip("/")
+    current = share.remote_prefix
+    for part in rel.split("/"):
+        names = remote_listdir(share.host, current)
+        if part in names:
+            chosen = part
+        else:
+            target = match_key(part)
+            matches = [name for name in names if match_key(name) == target]
+            if len(matches) == 1:
+                chosen = matches[0]
+            elif len(matches) > 1:
+                raise TranscodeException(
+                    'Multiple remote names match "{0}" in "{1}"'.format(part, current)
+                )
+            else:
+                raise TranscodeException(
+                    'No remote file matches "{0}" in "{1}"'.format(part, current)
+                )
+        current = current + "/" + chosen
+    return current
+
+
+def remote_cat(host: str, remote_path: str, dest_path: str) -> None:
+    """Copy ``remote_path`` onto ``dest_path``. Does not touch the remote file."""
+    data = _remote_request(host, {"op": "cat", "path": remote_path})
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with open(dest_path, "wb") as fh:
+        fh.write(data)
+
+
+def file_readable(path: str) -> bool:
+    """Return True when ``path`` can be opened and read through the local mount."""
+    try:
+        with open(path, "rb") as fh:
+            fh.read(1)
+    except OSError:
+        return False
+    return True
+
+
+def _iter_album_files(source_dir: str):
+    for dirpath, dirnames, filenames in os.walk(source_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            yield os.path.join(dirpath, filename)
+
+
+def stage_unreadable(source_dir: str, dest_dir: str, share: RemoteShare | None) -> bool:
+    """Stage ``source_dir`` into ``dest_dir`` when any file cannot be opened locally.
+
+    Readable files are symlinked. Unreadable files are copied over SSH using the
+    server's stored name. Nothing under ``source_dir`` is renamed or rewritten.
+    Returns True when a copy was required. When every file opens, ``dest_dir``
+    is left untouched and False is returned.
+    """
+    source_dir = os.path.abspath(source_dir)
+    files = list(_iter_album_files(source_dir))
+    unreadable = {src for src in files if not file_readable(src)}
+    if not unreadable:
+        return False
+    if share is None:
+        extra = len(unreadable) - 1
+        message = 'Cannot open "{0}"'.format(next(iter(unreadable)))
+        if extra:
+            message += " and {0} more".format(extra)
+        message += (
+            ". Set remote_host and remote_path to copy them over SSH "
+            "without changing the seeded files."
+        )
+        raise TranscodeException(message)
+
+    LOGGER.info(
+        "Copying %s file(s) over SSH from %s; seeded files stay unchanged",
+        len(unreadable),
+        share.host,
+    )
+    for src in files:
+        rel = os.path.relpath(src, source_dir)
+        dst = os.path.join(dest_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if src in unreadable:
+            remote_cat(share.host, resolve_remote_path(share, src), dst)
+        else:
+            _stage_link(src, dst)
+    return True
+
+
+def _remote_mktorrent(share: RemoteShare, remote_dir: str, announce: str, source: str | None) -> bytes:
+    # The announce URL contains the passkey, so it stays in the request body
+    # and out of the log.
+    LOGGER.info("Creating torrent on %s from server filenames", share.host)
+    return _remote_request(share.host, {
+        "op": "mktorrent",
+        "directory": remote_dir,
+        "announce": announce,
+        "source": source,
+    })
+
+
+def make_torrent(
+    input_dir: str,
+    output_dir: str,
+    tracker: str,
+    passkey: str,
+    source: str | None,
+    share: RemoteShare | None = None,
+) -> str:
     torrent = os.path.join(output_dir, path.basename(input_dir)) + ".torrent"
     if not path.exists(path.dirname(torrent)):
         os.makedirs(path.dirname(torrent))
     tracker_url = f"{tracker}{passkey}/announce"
+    if share is not None and share.remote_for(input_dir) is not None:
+        remote_dir = resolve_remote_path(share, input_dir)
+        data = _remote_mktorrent(share, remote_dir, tracker_url, source)
+        with open(torrent, "wb") as fh:
+            fh.write(data)
+        return torrent
     if source == None:
         command = ["mktorrent", "-p", "-a", tracker_url, "-o", torrent, input_dir]
     else:
