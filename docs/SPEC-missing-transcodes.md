@@ -52,7 +52,9 @@ transcode-and-upload flow.
   - `both` = snatched + uploaded. `seeding` uses `better.php`.
   - Yields `(group_id, torrent_id)` tuples. Only FLAC sources
     (hardcoded `&format=FLAC` in the URL).
-- Rate limiting: `min_sec_between_requests = 5.0s` enforced across all requests.
+- Rate limiting: at most 4 requests in any 10 seconds, and at most 10
+  `torrentgroup` calls in any 60 seconds. A `Rate limit exceeded` response
+  waits out that window and retries the same call.
 
 ### 2.3 "What formats are missing" logic (the other part we reuse)
 In [`orpheusmorebetter`](../orpheusmorebetter) `formats_needed(group, torrent, requested_formats)`:
@@ -171,8 +173,8 @@ $ orpheusmorebetter backlog.txt   # transcode + upload the backlog
   `is_24bit` and need the FLAC on disk). So the URL list may contain a few
   releases the transcode step will later skip. Acceptable for a discovery tool;
   document it. **Decided: no local checks in v1** (purely API-based).
-- **Rate limiting cost**: one `torrentgroup` ajax call per candidate at 5s each.
-  A 500-item history ≈ 40+ minutes. Mitigations:
+- **Rate limiting cost**: one `torrentgroup` ajax call per candidate, at most
+  10 per minute. A 500-item history takes about an hour. Mitigations:
   - A separate SQLite file, path set by the `missing_cache` config key (blank
     disables it). Albums stored as **complete** for the current format set are
     skipped on later runs. Albums still **missing** a format are fetched again

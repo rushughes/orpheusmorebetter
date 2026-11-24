@@ -26,6 +26,16 @@ lossless_media = set(media_search_map.keys())
 
 LOGGER = logging.getLogger("api")
 
+# Gazelle asks for no more than 5 requests every 10 seconds. torrentgroup is
+# capped at 15 per 60 seconds on a counter shared with every other client on
+# this account, and a rejected call still increments it. Stay under both.
+MAX_REQUESTS_PER_WINDOW = 4
+REQUEST_WINDOW_SEC = 10.0
+MAX_TORRENTGROUP_PER_WINDOW = 10
+TORRENTGROUP_WINDOW_SEC = 60.0
+RATE_LIMIT_ERROR = "Rate limit exceeded"
+RATE_LIMIT_ATTEMPTS = 3
+
 class WhatAPI:
     def __init__(
         self,
@@ -42,8 +52,8 @@ class WhatAPI:
         assert endpoint.endswith("/")
         self.base_url: str = endpoint
 
-        self.last_request = time.time()
-        self.min_sec_between_requests = 5.0
+        self._request_times: list[float] = []
+        self._torrentgroup_times: list[float] = []
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -76,6 +86,42 @@ class WhatAPI:
         r.raise_for_status()
         assert r.cookies is not None
         LOGGER.info(f"Orpheus session opened successfully.")
+        self._note_request()
+
+    def _wait_for_slot(self, action: str | None = None) -> None:
+        """Sleep until this request fits the published request windows."""
+        while True:
+            now = time.time()
+            self._request_times = sorted(
+                t for t in self._request_times if now - t < REQUEST_WINDOW_SEC
+            )
+            wait = 0.0
+            if len(self._request_times) >= MAX_REQUESTS_PER_WINDOW:
+                wait = REQUEST_WINDOW_SEC - (now - self._request_times[0])
+            if action == "torrentgroup":
+                self._torrentgroup_times = sorted(
+                    t
+                    for t in self._torrentgroup_times
+                    if now - t < TORRENTGROUP_WINDOW_SEC
+                )
+                if len(self._torrentgroup_times) >= MAX_TORRENTGROUP_PER_WINDOW:
+                    group_wait = TORRENTGROUP_WINDOW_SEC - (
+                        now - self._torrentgroup_times[0]
+                    )
+                    wait = max(wait, group_wait)
+            if wait <= 0:
+                return
+            time.sleep(wait)
+
+    def _note_request(self, action: str | None = None) -> None:
+        now = time.time()
+        self._request_times.append(now)
+        if action == "torrentgroup":
+            self._torrentgroup_times.append(now)
+
+    def _acquire(self, action: str | None = None) -> None:
+        self._wait_for_slot(action)
+        self._note_request(action)
 
     def request_ajax(
         self,
@@ -86,10 +132,6 @@ class WhatAPI:
         **kwargs: Any,
     ) -> Any:
         """Makes an AJAX request at a given action page"""
-        time_since_last_req = time.time() - self.last_request
-        if time_since_last_req < self.min_sec_between_requests:
-            time.sleep(self.min_sec_between_requests - time_since_last_req)
-
         ajaxpage = "{0}ajax.php".format(self.base_url)
         params = {
             "action": action,
@@ -97,45 +139,55 @@ class WhatAPI:
 
         params.update(kwargs)
 
-        if method == "GET":
-            params.update({"auth": self.authkey})
-            r = self.session.get(ajaxpage, params=params)
-        elif method == "POST":
-            if data is not None:
-                data.update({"auth": self.authkey})
-            r = self.session.post(ajaxpage, params=params, data=data, files=files)
+        for attempt in range(1, RATE_LIMIT_ATTEMPTS + 1):
+            self._acquire(action)
+            if method == "GET":
+                params.update({"auth": self.authkey})
+                r = self.session.get(ajaxpage, params=params)
+            elif method == "POST":
+                if data is not None:
+                    data.update({"auth": self.authkey})
+                r = self.session.post(ajaxpage, params=params, data=data, files=files)
 
-        self.last_request = time.time()
+            try:
+                LOGGER.debug(f"Received response with status code {r.status_code}")
+                parsed = r.json()
+            except ValueError as e:
+                raise RequestException from e
 
-        try:
-            LOGGER.debug(f"Received response with status code {r.status_code}")
-            parsed = r.json()
-            if parsed["status"] != "success":
-                raise RequestException(parsed["error"])
-            return parsed["response"]
-        except ValueError as e:
-            raise RequestException from e
+            if parsed["status"] == "success":
+                return parsed["response"]
+
+            error = parsed["error"]
+            if error == RATE_LIMIT_ERROR and attempt < RATE_LIMIT_ATTEMPTS:
+                pause = (
+                    TORRENTGROUP_WINDOW_SEC
+                    if action == "torrentgroup"
+                    else REQUEST_WINDOW_SEC
+                )
+                LOGGER.info(
+                    "Rate limit exceeded on %s; pausing for %.0f seconds",
+                    action,
+                    pause,
+                )
+                time.sleep(pause)
+                continue
+            raise RequestException(error)
 
     def request_webpage(self, action: str, **kwargs: Any):
         """Grab the HTML content of a page"""
-        time_since_last_req = time.time() - self.last_request
-        if time_since_last_req < self.min_sec_between_requests:
-            time.sleep(self.min_sec_between_requests - time_since_last_req)
+        self._acquire()
 
         url = self.base_url + action
         params = {"auth": self.authkey} | kwargs
         r = self.session.get(url, params=params, allow_redirects=False)
-        self.last_request = time.time()
         return r.content
 
     def get_html(self, url: str):
-        time_since_last_req = time.time() - self.last_request
-        if time_since_last_req < self.min_sec_between_requests:
-            time.sleep(self.min_sec_between_requests - time_since_last_req)
+        self._acquire()
 
         params = {"auth": self.authkey}
         r = self.session.get(url, params=params, allow_redirects=False)
-        self.last_request = time.time()
         return r.text
 
     def crawl_torrents_php(
@@ -292,10 +344,8 @@ class WhatAPI:
 
         url = f"{self.base_url}/torrents.php?action=edit&id={torrent.id}"
 
-        while time.time() - self.last_request < self.min_sec_between_requests:
-            time.sleep(0.1)
+        self._acquire()
         self.session.post(url, data=data)
-        self.last_request = time.time()
 
     def release_url(self, group: TorrentGroup, torrent: Torrent):
         return f"{self.base_url}/torrents.php?id={group.id}&torrentid={torrent.id}#torrent{torrent.id}"
@@ -344,8 +394,7 @@ class WhatAPI:
 
     def get_torrent_file(self, torrent_id: int) -> bytes | None:
         """Downloads the torrent at torrent_id using the authkey and passkey"""
-        while time.time() - self.last_request < self.min_sec_between_requests:
-            time.sleep(0.1)
+        self._acquire()
 
         torrentpage = "{0}/torrents.php".format(self.base_url)
         params = {
@@ -357,7 +406,6 @@ class WhatAPI:
 
         r = self.session.get(torrentpage, params=params, allow_redirects=False)
 
-        self.last_request = time.time() + 2.0
         if (
             r.status_code == 200
             and "application/x-bittorrent" in r.headers["content-type"]
