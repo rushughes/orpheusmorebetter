@@ -146,9 +146,10 @@ def copy_tags(flac_file: str, transcode_file: str):
                 totaltracks = scrub_tag("tracktotal", flac_info["tracktotal"][0])
 
             if totaltracks:
-                transcode_info["tracknumber"] = [
-                    "%s/%s" % (transcode_info["tracknumber"][0], totaltracks)
-                ]
+                # The tracknumber may already be fractional (e.g. "42/80"); use
+                # only the numerator so we don't produce "42/80/80".
+                track = transcode_info["tracknumber"][0].split("/")[0]
+                transcode_info["tracknumber"] = ["%s/%s" % (track, totaltracks)]
 
         if "discnumber" in transcode_info.keys():
             totaldiscs = None
@@ -158,9 +159,10 @@ def copy_tags(flac_file: str, transcode_file: str):
                 totaldiscs = scrub_tag("disctotal", flac_info["disctotal"][0])
 
             if totaldiscs:
-                transcode_info["discnumber"] = [
-                    "%s/%s" % (transcode_info["discnumber"][0], totaldiscs)
-                ]
+                # discnumber may already be fractional (e.g. "1/2"); use only
+                # the numerator so we don't produce "1/2/2".
+                disc = transcode_info["discnumber"][0].split("/")[0]
+                transcode_info["discnumber"] = ["%s/%s" % (disc, totaldiscs)]
 
     transcode_info.save()
 
