@@ -173,8 +173,9 @@ def test_make_torrent_uses_local_mktorrent_when_unmapped(tmp_path, monkeypatch):
     def fake_local(command, stderr=None):
         calls.append(command)
         torrent_path = command[command.index("-o") + 1]
+        # Already NFC, so make_torrent must leave the bytes unchanged.
         with open(torrent_path, "wb") as fh:
-            fh.write(b"local-torrent")
+            fh.write(_nfc_torrent())
         return b""
 
     def fake_ssh(host, request):
@@ -190,7 +191,51 @@ def test_make_torrent_uses_local_mktorrent_when_unmapped(tmp_path, monkeypatch):
     assert "-p" in calls[0]
     assert calls[0][calls[0].index("-s") + 1] == "OPS"
     assert result.endswith(album.name + ".torrent")
-    assert open(result, "rb").read() == b"local-torrent"
+    assert open(result, "rb").read() == _nfc_torrent()
+
+
+def _torrent(name: str, filename: str, pieces: bytes = b"\x11" * 20) -> bytes:
+    info = {
+        b"files": [{b"length": 3, b"path": [filename.encode("utf-8")]}],
+        b"name": name.encode("utf-8"),
+        b"piece length": 16384,
+        b"pieces": pieces,
+    }
+    return transcode.bencode({
+        b"announce": b"https://tracker/announce",
+        b"info": info,
+    })
+
+
+def _nfc_torrent() -> bytes:
+    return _torrent("Album", "01 Track.mp3")
+
+
+def test_nfc_torrent_paths_composes_decomposed_names(tmp_path):
+    nfc_name = "11. La Profondit\u00e0.mp3"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    pieces = b"\xab" * 20
+    torrent = tmp_path / "release.torrent"
+    torrent.write_bytes(_torrent("Le onde", nfd_name, pieces))
+
+    transcode.nfc_torrent_paths(str(torrent))
+
+    data, consumed = transcode.bdecode(torrent.read_bytes())
+    assert consumed == torrent.stat().st_size
+    info = data[b"info"]
+    assert info[b"pieces"] == pieces
+    assert info[b"files"][0][b"path"] == [nfc_name.encode("utf-8")]
+    assert info[b"name"] == "Le onde".encode("utf-8")
+
+
+def test_nfc_torrent_paths_leaves_composed_torrent_unchanged(tmp_path):
+    raw = _nfc_torrent()
+    torrent = tmp_path / "release.torrent"
+    torrent.write_bytes(raw)
+
+    transcode.nfc_torrent_paths(str(torrent))
+
+    assert torrent.read_bytes() == raw
 
 
 def test_remote_script_compiles():

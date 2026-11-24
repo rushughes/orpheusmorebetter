@@ -411,9 +411,11 @@ def transcode(flac_file: str, output_dir: str, output_format: Format) -> str:
             'FLAC file "{0}" has more than 2 channels, unsupported'.format(flac_file)
         )
 
-    # determine the new filename
+    # determine the new filename. Compose to NFC so the name written through
+    # a Mac Samba client matches the composed form the Linux disk stores.
     transcode_basename = path.splitext(os.path.basename(flac_file))[0]
     transcode_basename = re.sub(r'[\?<>\\*\|":]', "_", transcode_basename)
+    transcode_basename = unicodedata.normalize("NFC", transcode_basename)
     transcode_file = path.join(output_dir, transcode_basename)
 
 
@@ -878,6 +880,112 @@ def stage_unreadable(source_dir: str, dest_dir: str, share: RemoteShare | None) 
     return True
 
 
+def bdecode(data: bytes, index: int = 0):
+    """Decode one bencode value. Returns ``(value, index_after)``."""
+    kind = data[index:index + 1]
+    if kind == b"i":
+        end = data.index(b"e", index)
+        return int(data[index + 1:end]), end + 1
+    if kind == b"l":
+        index += 1
+        items = []
+        while data[index:index + 1] != b"e":
+            value, index = bdecode(data, index)
+            items.append(value)
+        return items, index + 1
+    if kind == b"d":
+        index += 1
+        mapping = {}
+        while data[index:index + 1] != b"e":
+            key, index = bdecode(data, index)
+            value, index = bdecode(data, index)
+            mapping[key] = value
+        return mapping, index + 1
+    colon = data.index(b":", index)
+    length = int(data[index:colon])
+    start = colon + 1
+    return data[start:start + length], start + length
+
+
+def bencode(value) -> bytes:
+    """Encode a bencode value. Dict keys are emitted in sorted order."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return b"i" + str(value).encode("ascii") + b"e"
+    if isinstance(value, bytes):
+        return str(len(value)).encode("ascii") + b":" + value
+    if isinstance(value, list):
+        return b"l" + b"".join(bencode(item) for item in value) + b"e"
+    if isinstance(value, dict):
+        parts = []
+        for key in sorted(value):
+            parts.append(bencode(key))
+            parts.append(bencode(value[key]))
+        return b"d" + b"".join(parts) + b"e"
+    raise TypeError("Cannot bencode {0}".format(type(value).__name__))
+
+
+def _nfc_bytes(blob: bytes) -> bytes:
+    text = blob.decode("utf-8")
+    composed = unicodedata.normalize("NFC", text)
+    if composed == text:
+        return blob
+    return composed.encode("utf-8")
+
+
+def nfc_torrent_paths(torrent_path: str) -> None:
+    """Rewrite torrent filenames to NFC.
+
+    macOS presents Samba names in NFD, so a local ``mktorrent`` records
+    decomposed filenames. The Linux disk stores the composed form, and
+    qBittorrent then cannot find those files. Piece hashes are file bytes,
+    not names, so only the name strings change. A torrent that is already
+    NFC is left byte-for-byte untouched. Call this for a locally built
+    torrent only; a torrent built on the server already uses the on-disk
+    spelling.
+    """
+    with open(torrent_path, "rb") as fh:
+        raw = fh.read()
+    try:
+        data, consumed = bdecode(raw)
+    except (ValueError, IndexError, UnicodeError) as exc:
+        raise TranscodeException(
+            "Could not read torrent {0}: {1}".format(torrent_path, exc)
+        )
+    if consumed != len(raw) or not isinstance(data, dict):
+        raise TranscodeException("Torrent {0} is not valid bencode".format(torrent_path))
+    info = data.get(b"info")
+    if not isinstance(info, dict):
+        raise TranscodeException("Torrent {0} has no info dict".format(torrent_path))
+
+    changed = False
+    name = info.get(b"name")
+    if isinstance(name, bytes):
+        composed = _nfc_bytes(name)
+        if composed != name:
+            info[b"name"] = composed
+            changed = True
+    files = info.get(b"files")
+    if isinstance(files, list):
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            parts = entry.get(b"path")
+            if not isinstance(parts, list):
+                continue
+            composed_parts = [
+                _nfc_bytes(part) if isinstance(part, bytes) else part
+                for part in parts
+            ]
+            if composed_parts != parts:
+                entry[b"path"] = composed_parts
+                changed = True
+    if not changed:
+        return
+    LOGGER.info("Normalized torrent filenames to NFC so they match the Linux disk")
+    with open(torrent_path, "wb") as fh:
+        fh.write(bencode(data))
+
+
 def _remote_mktorrent(share: RemoteShare, remote_dir: str, announce: str, source: str | None) -> bytes:
     # The announce URL contains the passkey, so it stays in the request body
     # and out of the log.
@@ -913,4 +1021,5 @@ def make_torrent(
     else:
         command = ["mktorrent", "-p", "-s", source, "-a", tracker_url, "-o", torrent, input_dir]
     subprocess.check_output(command, stderr=subprocess.STDOUT)
+    nfc_torrent_paths(torrent)
     return torrent
